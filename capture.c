@@ -4,6 +4,7 @@
 #include "urls.h"
 #include "log.h"
 #include "http_parser.h"
+#include "util.h"
 #include <pthread.h>
 #include <pcap/pcap.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #define DEFAULT_CAP_THREAD_NUM  8
 #define DEFAULT_CAP_RING_NUM    2048
 #define DEFAULT_CAP_FILTER      "greater 100 and dst port 80"
+#define DEFAULT_CAP_BUF_SIZE    512 * 1024 * 1024  //512m
 
 #define MAX_PACKET_LEN  65535
 
@@ -32,7 +34,10 @@ static const char http_302_str[] = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n"
 
 char pushaddr[MAX_URL_LEN];
 
+uint8_t srcmac[6] = {0};
+
 typedef struct {
+    int                index;
     pthread_t          tid;
     lkf_ring_t        *ring;
     libnet_t          *inject_net;
@@ -92,6 +97,10 @@ static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len)
         return 0;
     }
 
+    if (len >= MAX_HOST_LEN) {
+        return 1;
+    }
+
     memcpy(url->host, buf, len);
 
     return -1;
@@ -100,6 +109,10 @@ static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len)
 static int cap_url_cb(http_parser *parser, const char *buf, size_t len)
 {
     cap_url_t *url = (cap_url_t *)parser->data;
+
+    if (len >= MAX_URL_LEN) {
+        return -1;
+    }
 
     memcpy(url->url, buf, len);
 
@@ -145,11 +158,7 @@ static void cap_service_packet_inject_rst(struct ether_header *eth_hdr,
 		ntohs(tcp_hdr->dest),                          // dp
 		ntohl(tcp_hdr->seq),                            // seq
         ntohl(tcp_hdr->ack_seq),                            // ack
-#ifdef WITH_FIN
-        TH_FIN|TH_RST,                        // ctl
-#else
         TH_RST,
-#endif
 		tcp_hdr->window,                   // win
 		0,                             // sum
 		0,                             // urg
@@ -180,7 +189,7 @@ static void cap_service_packet_inject_rst(struct ether_header *eth_hdr,
 	}    
 
 	if(libnet_build_ethernet((void*) ether_mac,  // dst
-		(void*)eth_hdr->ether_dhost,             // src
+		(void*)srcmac,                           // src
 		ETHERTYPE_IP,                            // prot
 		NULL,                                    // payload
 		0,                                       // paylen
@@ -259,7 +268,7 @@ static void cap_service_packet_inject_app(struct ether_header *eth_hdr,
     }
     
 	if(libnet_build_ethernet((void *)ether_mac,   // dst
-		(void *)eth_hdr->ether_dhost,              // src
+		(void *)srcmac,                           // src
 		ETHERTYPE_IP,                             // prot
 		NULL,                                     // payload
 		0,                                        // paylen
@@ -348,12 +357,10 @@ static void cap_service_working_helper(cap_packet_t *packet, cap_thread_t *threa
 
     if (len <= 0) return;
 
-    if (!cap_service_need_hijack(cp, len, &url)) {
-        return;
+    if (cap_service_need_hijack(cp, len, &url)) {
+        cap_service_packet_inject_app(eth_hdr, ip_hdr, tcp_hdr, tcp_dl, &url, thread);
+        cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr, thread);
     }
-
-    cap_service_packet_inject_app(eth_hdr, ip_hdr, tcp_hdr, tcp_dl, &url, thread);
-    cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr, thread);
 
     return;
 }
@@ -362,6 +369,11 @@ static void *cap_service_working(void *arg)
 {
     cap_thread_t *thread = (cap_thread_t *)arg;
     cap_packet_t *packet;
+
+    if (stick_thread_to_core(thread->index)) {
+        log_fatal("capture service, failed stick thread %s to core", thread->index);
+        exit(1);
+    }
 
     while (1) {
         while (!(packet = (cap_packet_t *)lkf_ring_pop(thread->ring))) {
@@ -386,6 +398,7 @@ static void cap_service_init_thread(hijack_conf_t *conf)
     cap_threads = (cap_thread_t *)calloc(cap_num, sizeof(cap_thread_t));
 
     for (i = 0; i < cap_num; i++) {
+        cap_threads[i].index = i;
         cap_threads[i].ring = lkf_ring_init(DEFAULT_CAP_RING_NUM);
         cap_threads[i].inject_net = libnet_init(LIBNET_LINK, (const char *)conf->net_send, errbuf);
         if (cap_threads[i].inject_net == NULL) {
@@ -402,7 +415,7 @@ static void cap_service_init_thread(hijack_conf_t *conf)
 
     return;
 }
-/*
+
 static int cap_push_packet(cap_packet_t *packet)
 {
     static int index = 0;
@@ -428,25 +441,30 @@ static int cap_push_packet(cap_packet_t *packet)
 
     return -1;
 }
-*/
+
 void *cap_service(void *arg)
 {
     int            ret;
     uint32_t       pn, ln;
-    u_char        *raw;
+    const u_char  *raw;
     char           errbuf[PCAP_ERRBUF_SIZE];
     pcap_t        *pcap;
     bpf_u_int32    netp;
     bpf_u_int32    mask;
-    struct bpf_program  fp;
-    struct pcap_pkthdr  pkthdr;
-    struct pcap_stat    ps;
+    struct bpf_program   fp;
+    struct pcap_pkthdr  *pkthdr;
+    struct pcap_stat     ps;
 
     hijack_conf_t *conf;
 
     cap_packet_t *packet;
     
     conf = (hijack_conf_t *)arg;
+
+    if (get_net_mac(conf->net_send, srcmac)) {
+        log_error("failed init inject mac address");
+        exit(-1);
+    }
 
     cap_service_init_thread(conf);
 
@@ -457,11 +475,19 @@ void *cap_service(void *arg)
     }
 
     pcap_lookupnet(conf->net_pcap, &netp, &mask, errbuf);
-    
+/*    
     if (pcap_set_snaplen(pcap, MAX_PACKET_LEN)) {
         log_error("failed set capture packet length, %s", pcap_geterr(pcap));
         exit(1);
     }    
+*/
+
+/*
+    if (pcap_set_buffer_size(pcap, DEFAULT_CAP_BUF_SIZE)) {
+        log_error("failed set capture buffer size, %s", pcap_geterr(pcap));
+        exit(1);
+    }
+*/
 
     if (pcap_set_promisc(pcap, 1)) {
         log_error("failed set capture promisc mode, %s", pcap_geterr(pcap));
@@ -501,27 +527,27 @@ void *cap_service(void *arg)
     while (1) {
         memset(&pkthdr, 0x00, sizeof(struct pcap_pkthdr));
 
-		raw = (u_char *)pcap_next(pcap, &pkthdr);
-		if (raw == NULL) {
-            log_warn("capture unexpected return, continue capture");
+		ret = pcap_next_ex(pcap, &pkthdr, &raw);
+		if (ret != 1) {
+            log_warn("capture unexpected return[%s], continue capture", ret == 0 ? "Timedout" : pcap_geterr(pcap));
             continue;
         }
 
         pn++;
 
-        if (pkthdr.caplen > MAX_PACKET_LEN) {
-            log_warn("capture very big packet, discard it");
+        if (pkthdr->caplen > MAX_PACKET_LEN || pkthdr->caplen < 100) {
+            log_warn("capture very big or small packet, discard it");
             continue;
-        }        
-
+        }
+        
         packet = (cap_packet_t *)calloc(1, sizeof(cap_packet_t));
         if (packet == NULL) {
             log_warn("capture thread lack of memory");
             continue;
         }
 
-        memcpy(packet->raw, raw, pkthdr.caplen);
-        packet->len = pkthdr.caplen;
+        memcpy(packet->raw, raw, pkthdr->caplen);
+        packet->len = pkthdr->caplen;
 
         ret = cap_push_packet(packet);
         if (ret == -1) {

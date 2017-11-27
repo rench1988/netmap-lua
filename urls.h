@@ -1,7 +1,7 @@
 #ifndef __urls_h__
 #define __urls_h__
 
-#define MAX_URL_LEN  2048
+#define MAX_URL_LEN  4098
 
 #define URL_SPLIT  '/'
 

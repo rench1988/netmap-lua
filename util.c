@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -8,6 +10,9 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <linux/if.h>
 #include "util.h"
 
 #define path_split  '/'
@@ -107,5 +112,42 @@ int turn_on_core(void)
     core_limit.rlim_max = RLIM_INFINITY;
     
     return setrlimit(RLIMIT_CORE, &core_limit);
+}
+
+int stick_thread_to_core(int core_id) 
+{
+   int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+   if (core_id < 0 || core_id >= num_cores)
+      return EINVAL;
+
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();    
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
+
+int get_net_mac(char *ethname, uint8_t *srcmac)
+{
+    int                 sockfd;  
+    struct ifreq        ifr;  
+      
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);  
+    if (sockfd == -1) {  
+        return -1;
+    }  
+      
+    strcpy(ifr.ifr_name, ethname);
+
+    if (ioctl(sockfd, SIOCGIFHWADDR, &ifr)) {
+        return -1;
+    }
+
+    memcpy(srcmac, ifr.ifr_hwaddr.sa_data, 6);
+
+    close(sockfd);
+
+    return 0;
 }
 

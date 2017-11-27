@@ -107,7 +107,7 @@ int main(int argc, const char *argv[])
     turn_on_core();
 
     pthread_create(&rpc_tid, NULL, rpc_service, hijack_conf);
-//    pthread_create(&cap_tid, NULL, cap_service, hijack_conf);
+    pthread_create(&cap_tid, NULL, cap_service, hijack_conf);
 
 
 

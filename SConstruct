@@ -11,9 +11,9 @@ AddOption('--with-fin',
           help='with-fin')
 
 with_debug = GetOption('with-debug')
-with_fin = GetOption('with-debug')
+with_fin = GetOption('with-fin')
 
-ccflags = '-Wall -Werror -fno-strict-aliasing'
+ccflags = '-Wall -Werror -Wunused-function -Wunused-variable -fno-strict-aliasing'
 
 if with_debug:
     ccflags += ' -ggdb3 -O0'
