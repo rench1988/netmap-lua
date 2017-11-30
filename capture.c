@@ -19,7 +19,7 @@
 #include <libnet.h>
 
 #define DEFAULT_CAP_THREAD_NUM  8
-#define DEFAULT_CAP_RING_NUM    2048
+#define DEFAULT_CAP_RING_NUM    128
 #define DEFAULT_CAP_FILTER      "greater 100 and dst port 80"
 #define DEFAULT_CAP_BUF_SIZE    512 * 1024 * 1024  //512m
 
@@ -125,6 +125,10 @@ static int cap_service_need_hijack(u_char *http_data, size_t n, cap_url_t *url)
     http_parser parser;
     char       *pos;
     char        tmp[MAX_URL_LEN];
+
+    if (http_data[0] != 'G' && http_data[0] != 'P') {
+        return 0;
+    }
 
     memset(url, 0x00, sizeof(cap_url_t));
 
@@ -371,7 +375,7 @@ static void *cap_service_working(void *arg)
     cap_packet_t *packet;
 
     if (stick_thread_to_core(thread->index)) {
-        log_fatal("capture service, failed stick thread %s to core", thread->index);
+        log_fatal("capture service, failed stick thread %d to core", thread->index);
         exit(1);
     }
 
@@ -393,12 +397,12 @@ static void cap_service_init_thread(hijack_conf_t *conf)
     int    i;
     char   errbuf[LIBNET_ERRBUF_SIZE];
 
-    cap_num = conf->cap_thread <= 0 ? DEFAULT_CAP_THREAD_NUM : conf->cap_thread;
+    cap_num = conf->proc_thread_num;
 
     cap_threads = (cap_thread_t *)calloc(cap_num, sizeof(cap_thread_t));
 
-    for (i = 0; i < cap_num; i++) {
-        cap_threads[i].index = i;
+    for (i = 0; i < conf->proc_thread_num; i++) {
+        cap_threads[i].index = conf->proc_thread_core[i];
         cap_threads[i].ring = lkf_ring_init(DEFAULT_CAP_RING_NUM);
         cap_threads[i].inject_net = libnet_init(LIBNET_LINK, (const char *)conf->net_send, errbuf);
         if (cap_threads[i].inject_net == NULL) {
@@ -489,11 +493,22 @@ void *cap_service(void *arg)
     }
 */
 
+/*
     if (pcap_set_promisc(pcap, 1)) {
         log_error("failed set capture promisc mode, %s", pcap_geterr(pcap));
         exit(1);
     }
-
+*/
+    if (pcap_set_immediate_mode(pcap, 1)) {
+        log_error("failed set capture to immediate mode, %s", pcap_geterr(pcap));
+        exit(1);
+    }
+/*
+    if (pcap_set_rfmon(pcap, 1)) {
+        log_error("failed set capture to rfmon, %s", pcap_geterr(pcap));
+        exit(1);
+    }
+*/
     if (pcap_activate(pcap) < 0) {
         log_error("failed activate capture handler, %s", pcap_geterr(pcap));
         exit(1);
@@ -520,6 +535,11 @@ void *cap_service(void *arg)
         exit(-1);
     }
 
+    if (stick_thread_to_core(conf->cap_thread_core)) {
+        log_fatal("capture service, failed stick thread %d to core", 0);
+        exit(1);
+    }    
+
     strncpy(pushaddr, conf->pushaddr, MAX_URL_LEN - 1);
     
     pn = 0;
@@ -529,7 +549,7 @@ void *cap_service(void *arg)
 
 		ret = pcap_next_ex(pcap, &pkthdr, &raw);
 		if (ret != 1) {
-            log_warn("capture unexpected return[%s], continue capture", ret == 0 ? "Timedout" : pcap_geterr(pcap));
+            if (ret != 0) log_warn("capture unexpected return[%s], continue capture", pcap_geterr(pcap));
             continue;
         }
 

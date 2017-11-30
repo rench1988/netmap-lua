@@ -64,7 +64,7 @@ int main(int argc, const char *argv[])
     int             debug;
     char           *conf_file;
     pthread_t       rpc_tid, cap_tid;
-    hijack_conf_t  *hijack_conf;
+    hijack_conf_t  *conf;
 
     debug = 0;
     conf_file = NULL;
@@ -91,14 +91,19 @@ int main(int argc, const char *argv[])
         exit(0);
     }
 
-    hijack_conf = parse_hijack_conf(conf_file);
-    if (!hijack_conf) {
+    conf = parse_hijack_conf(conf_file);
+    if (!conf) {
         exit(-1);
     }
 
-    print_all_conf(hijack_conf);
+    print_all_conf(conf);
 
-    hijack_log_init(hijack_conf);
+    if (conf->proc_thread_num == 0) {
+        printf("must assign proc greater than 0" LINEFEED);
+        exit(0);
+    }
+
+    hijack_log_init(conf);
 
     printf("program start..." LINEFEED);
 
@@ -106,8 +111,8 @@ int main(int argc, const char *argv[])
 
     turn_on_core();
 
-    pthread_create(&rpc_tid, NULL, rpc_service, hijack_conf);
-    pthread_create(&cap_tid, NULL, cap_service, hijack_conf);
+    pthread_create(&rpc_tid, NULL, rpc_service, conf);
+    pthread_create(&cap_tid, NULL, cap_service, conf);
 
 
 

@@ -14,8 +14,12 @@
         "level": ""
     },
 
+    "threads": {
+        "cap": ,
+        "proc": [],
+    },
+
     "filter": ,
     "pushaddr": "http://113.18.253.249/push",
     "sendmac": "",
-    "threads": 4
 }

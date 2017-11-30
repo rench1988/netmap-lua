@@ -18,7 +18,9 @@ typedef struct {
 
     char  *cap_filter;
 
-    int    cap_thread;
+    int    cap_thread_core;
+    int   *proc_thread_core;
+    int    proc_thread_num;
 } hijack_conf_t;
 
 
