@@ -6,6 +6,7 @@
 #include "cJSON.h"
 #include "sock.h"
 #include "urls.h"
+#include "hijack.h"
 #include <ev.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -22,12 +23,17 @@
 #define RPC_TYPE_TOKEN  "type"
 #define RPC_URLS_TOKEN  "urls"
 
+#define MAX_PROC_FD   1024
+
 typedef enum {
     uadd = 1,
     udel
 } utype;
 
 struct ev_loop *rpc_loop;
+
+extern int            hjk_process_num;
+extern hjk_process_t  hjk_processes[HJK_MAX_PROCESSES];
 
 typedef struct {
     ev_io    rw_watcher;
@@ -140,11 +146,24 @@ static void rpc_req_response(rpc_connection_t *conn)
     return;
 }
 
+static void rpc_pipe_msg(char *buf, size_t len)
+{
+    int i, n;
+
+    for (i = 0; i < hjk_process_num; i++) {
+        n = write(hjk_processes[i].fd[1], buf, len);
+        if (n != len) {
+            log_error("failed send pipe msg to process %d", hjk_processes[i].pid);
+        }
+    }
+}
+
 static void rpc_req_process(rpc_connection_t *conn)
 {
-    int    i;
+    int    i, n;
     int    type;
     cJSON *root, *unode;
+    char   buf[MAX_URL_LEN + 2];
 
     root = cJSON_Parse(conn->body);
     if (!root) {
@@ -171,10 +190,14 @@ static void rpc_req_process(rpc_connection_t *conn)
         }
 
         if (type == uadd) {
-            add_url(subitem->valuestring);
+            buf[0] = '1';
         } else {
-            del_url(subitem->valuestring);
+            buf[0] = '2';
         }
+
+        n = snprintf(buf + 1, MAX_URL_LEN - 1, "%s\n", subitem->valuestring);
+
+        rpc_pipe_msg(buf, n + 1);
     }
 
     cJSON_Delete(root);
@@ -316,10 +339,9 @@ static void rpc_run(void)
 
 void *rpc_service(void *arg)
 {
-    hijack_conf_t  *conf = (hijack_conf_t *)arg;
+    hjk_conf_t *conf = (hjk_conf_t *)arg;
 
     rpc_init(conf->laddr, conf->lport);
-
     rpc_run();
 
     return NULL;

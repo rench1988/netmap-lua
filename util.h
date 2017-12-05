@@ -10,8 +10,10 @@ char *load_file(const char *filename);
 int mkpath(char* file_path, mode_t mode);
 int daemonize(void);
 int turn_on_core(void);
-int stick_thread_to_core(int core_id);
-int get_net_mac(char *ethname, uint8_t *srcmac);
-
+int set_pthread_affinity(int core);
+int nic_mac(char *ethname, uint8_t *srcmac);
+void initproctitle(int argc, char **argv);
+void setproctitle(const char *prog, const char *txt);
+char *cpystrn(char *dst, char *src, size_t n);
 #endif
 

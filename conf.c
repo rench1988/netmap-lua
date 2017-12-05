@@ -8,18 +8,23 @@
 #define TOKEN_RPC           "rpc"
 #define TOKEN_RPC_HOST      "host"
 #define TOKEN_RPC_PORT      "port"
-#define TOKEN_DEVICES       "devices"
-#define TOKEN_DEVICES_PCAP  "pcap"
-#define TOKEN_DEVICES_SEND  "send"
+
+#define TOKEN_CAPTURE               "capture"
+#define TOKEN_CAPTURE_DEV           "dev"
+#define TOKEN_CAPTURE_PROCS         "procs"
+#define TOKEN_CAPTURE_PROCS_CORE    "cpu"
+#define TOKEN_CAPTURE_PROCS_FILTER  "filter"
+
+#define TOKEN_INJECT        "inject"
+#define TOKEN_INJECT_DEV    "dev"
+#define TOKEN_INJECT_URL    "pushurl"
+#define TOKEN_INJECT_MAC    "mac"
+
 #define TOKEN_LOG           "log"
 #define TOKEN_LOG_FILE      "file"
 #define TOKEN_LOG_LEVEL     "level"   //"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
-#define TOKEN_PUSHADDR      "pushaddr"
-#define TOKEN_SENDMAC       "sendmac"
-#define TOKEN_FILTER        "filter"
-#define TOKEN_THREADS       "threads"
-#define TOKEN_THREAD_CAP    "cap"
-#define TOKEN_THREAD_PROC   "proc"
+
+static int parse_hijack_value(cJSON *root, const char *token, int type, char **result, int *num);
 
 int parse_hijack_unit(cJSON *root, const char *otoken, const char *itoken, int type, char **result, int *num)
 {
@@ -47,7 +52,7 @@ int parse_hijack_unit(cJSON *root, const char *otoken, const char *itoken, int t
     return 0;
 }
 
-int parse_hijack_unit_array(cJSON *root, const char *otoken, const char *itoken, int type, char **sresult, int **iresult, int *num)
+int parse_hijack_cap_proc_array(cJSON *root, const char *otoken, const char *itoken, cap_conf_t **confs, int *num)
 {
     int    i, size;
     cJSON *outer, *inner;
@@ -60,40 +65,41 @@ int parse_hijack_unit_array(cJSON *root, const char *otoken, const char *itoken,
     
     inner = cJSON_GetObjectItemCaseSensitive(outer, itoken);
     if (!inner || inner->type != cJSON_Array) {
-        printf("%s configuration in %s cant be null or illegal format" LINEFEED, itoken, otoken);
-        return -1;
+        goto failed;
     }
 
     size = cJSON_GetArraySize(inner);
     if (size == 0) {
-        return 0;
+        goto failed;
     }
 
     *num = size;
 
-    if (type == cJSON_Number) {
-        *iresult = (int *)calloc(size, sizeof(int));
-    } else if (type == cJSON_String) {
-         sresult = (char **)calloc(size, sizeof(char *));
-    } else {
-        return -1;
-    }
+    *confs = (cap_conf_t *)calloc(size, sizeof(cap_conf_t));
     
     for (i = 0; i < size; i++) {
         cJSON *subitem = cJSON_GetArrayItem(inner, i);
-        if (type == cJSON_Number && subitem->type == cJSON_Number) {
-            (*iresult)[i] = subitem->valuedouble;
+        if (subitem->type != cJSON_Object) {
+            goto failed;
         }
 
-        if (type == cJSON_String && subitem->type == cJSON_String) {
-            sresult[i] = strdup(subitem->valuestring);
+        if (parse_hijack_value(subitem, TOKEN_CAPTURE_PROCS_CORE, cJSON_Number, NULL, &((*confs)[i].core))) {
+            return -1;
+        }
+
+        if (parse_hijack_value(subitem, TOKEN_CAPTURE_PROCS_FILTER, cJSON_String, &((*confs)[i].filter),NULL)) {
+            return -1;
         }
     }
 
     return 0;
+
+failed:
+    printf("%s configuration in %s cant be null or illegal format" LINEFEED, itoken, otoken);
+    return -1;
 }
 
-int parse_hijack_value(cJSON *root, const char *token, int type, char **result, int *num)
+static int parse_hijack_value(cJSON *root, const char *token, int type, char **result, int *num)
 {
     cJSON *node;
 
@@ -118,15 +124,15 @@ int parse_hijack_value(cJSON *root, const char *token, int type, char **result, 
     return 0;    
 }
 
-hijack_conf_t *parse_hijack_conf(const char *filename)
+hjk_conf_t *parse_hijack_conf(const char *filename)
 {
     char           *fstr;
     cJSON          *root;
-    hijack_conf_t  *hijack_conf;
+    hjk_conf_t     *conf;
 
     fstr = NULL;
     root = NULL;
-    hijack_conf = (hijack_conf_t *)calloc(1, sizeof(hijack_conf_t));
+    conf = (hjk_conf_t *)calloc(1, sizeof(hjk_conf_t));
 
     fstr = load_file(filename);
     if (!fstr) {
@@ -138,24 +144,22 @@ hijack_conf_t *parse_hijack_conf(const char *filename)
         goto failed;
     }
 
-    if (parse_hijack_unit(root, TOKEN_RPC, TOKEN_RPC_HOST, cJSON_String, &hijack_conf->laddr, NULL) ||
-        parse_hijack_unit(root, TOKEN_RPC, TOKEN_RPC_PORT, cJSON_Number, NULL, &hijack_conf->lport) ||
-        parse_hijack_unit(root, TOKEN_DEVICES, TOKEN_DEVICES_PCAP, cJSON_String, &hijack_conf->net_pcap, NULL) ||
-        parse_hijack_unit(root, TOKEN_DEVICES, TOKEN_DEVICES_SEND, cJSON_String, &hijack_conf->net_send, NULL) ||
-        parse_hijack_unit(root, TOKEN_LOG, TOKEN_LOG_FILE, cJSON_String, &hijack_conf->log_file, NULL) ||
-        parse_hijack_unit(root, TOKEN_LOG, TOKEN_LOG_LEVEL, cJSON_String, &hijack_conf->log_level, NULL) ||
-        parse_hijack_value(root, TOKEN_PUSHADDR, cJSON_String, &hijack_conf->pushaddr, NULL) ||
-        parse_hijack_value(root, TOKEN_SENDMAC, cJSON_String, &hijack_conf->sendmac, NULL) ||
-        parse_hijack_value(root, TOKEN_FILTER, cJSON_String, &hijack_conf->cap_filter, NULL) ||
-        parse_hijack_unit(root, TOKEN_THREADS, TOKEN_THREAD_CAP, cJSON_Number, NULL, &hijack_conf->cap_thread_core) ||
-        parse_hijack_unit_array(root, TOKEN_THREADS, TOKEN_THREAD_PROC, cJSON_Number, NULL, &hijack_conf->proc_thread_core, &hijack_conf->proc_thread_num)) {
+    if (parse_hijack_unit(root, TOKEN_RPC, TOKEN_RPC_HOST, cJSON_String, &conf->laddr, NULL) ||
+        parse_hijack_unit(root, TOKEN_RPC, TOKEN_RPC_PORT, cJSON_Number, NULL, &conf->lport) ||
+        parse_hijack_unit(root, TOKEN_LOG, TOKEN_LOG_FILE, cJSON_String, &conf->log_file, NULL) ||
+        parse_hijack_unit(root, TOKEN_LOG, TOKEN_LOG_LEVEL, cJSON_String, &conf->log_level, NULL) ||
+        parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_DEV, cJSON_String, &conf->net_dev, NULL) ||
+        parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_URL, cJSON_String, &conf->net_url, NULL) ||
+        parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_MAC, cJSON_String, &conf->net_mac, NULL) ||
+        parse_hijack_unit(root, TOKEN_CAPTURE, TOKEN_CAPTURE_DEV, cJSON_String, &conf->cap_dev, NULL) ||
+        parse_hijack_cap_proc_array(root, TOKEN_CAPTURE, TOKEN_CAPTURE_PROCS, &conf->cap_conf, &conf->cap_num)) {
         goto failed;
     }
 
     cJSON_Delete(root);
     free(fstr);
 
-    return hijack_conf;
+    return conf;
 
 
 failed:
@@ -165,21 +169,24 @@ failed:
     return NULL;
 }
 
-void print_all_conf(hijack_conf_t *conf)
+void print_all_conf(hjk_conf_t *conf)
 {
     int i;
 
-    printf("configuration:" LINEFEED "listen on: %s:%d" LINEFEED "capture card: %s" LINEFEED "inject card: %s" LINEFEED
-            "log file: %s" LINEFEED "log level: %s" LINEFEED "pushaddr: %s" LINEFEED "inject mac: %s" LINEFEED
-            "capture filter: %s" LINEFEED,
-            conf->laddr, conf->lport, conf->net_pcap, conf->net_send, conf->log_file, conf->log_level,
-            conf->pushaddr, conf->sendmac, conf->cap_filter);
-
-    printf("capture thread attach core: %d" LINEFEED, conf->cap_thread_core);
+    printf("configuration:" LINEFEED 
+            "rpc listen on: %s:%d" LINEFEED 
+            "inject card: %s" LINEFEED
+            "inject push url: %s" LINEFEED
+            "inject push mac: %s" LINEFEED
+            "log file: %s" LINEFEED 
+            "log level: %s" LINEFEED,
+            conf->laddr, conf->lport, conf->net_dev, conf->net_url, conf->net_mac, 
+            conf->log_file, conf->log_level);
     
-    printf("packet process attach core: ");
-    for (i = 0; i < conf->proc_thread_num - 1; i++) {
-        printf("%d, ", conf->proc_thread_core[i]);
+    printf("capture dev: %s" LINEFEED, conf->cap_dev);
+
+    printf("capture procs: " LINEFEED);
+    for (i = 0; i < conf->cap_num; i++) {
+        printf("[num.%d] core capture [%s]" LINEFEED, conf->cap_conf[i].core, conf->cap_conf[i].filter);
     }
-    printf("%d" LINEFEED, conf->proc_thread_core[conf->proc_thread_num - 1]);
 }

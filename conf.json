@@ -1,25 +1,31 @@
 {
     "rpc": {
-        "host": "",
+        "host": "127.0.0.1",
         "port": 3132
     },
 
-    "devices": {
-        "pcap": "",
-        "send": "" 
+    "capture": {
+        "dev": "eth4",
+        "procs": [
+            {
+                "cpu": 23,
+                "filter": "greater 100 and tcp dst port 80 and ip[19] & 0x01 = 0 and (tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x47455420 or tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x504f5354"
+            },
+            {
+                "cpu": 22,
+                "filter": "greater 100 and tcp dst port 80 and ip[19] & 0x01 = 1 and (tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x47455420 or tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x504f5354"
+            }
+        ]
+    },
+
+    "inject": {
+        "dev": "eth0",
+        "pushurl": "http://113.18.253.249/push",
+        "mac": "" 
     },
 
     "log": {
         "file": "",
         "level": ""
-    },
-
-    "threads": {
-        "cap": ,
-        "proc": [],
-    },
-
-    "filter": ,
-    "pushaddr": "http://113.18.253.249/push",
-    "sendmac": "",
+    }
 }
