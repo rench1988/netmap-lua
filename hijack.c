@@ -59,7 +59,7 @@ void hjk_log_init(hjk_conf_t *conf)
         exit(-1);
     }
 
-    fp = fopen(conf->log_file == NULL ? DEFAULT_LOG_FILE : conf->log_file, "w");
+    fp = fopen(conf->log_file == NULL ? DEFAULT_LOG_FILE : conf->log_file, "a");
     if (!fp) {
         printf("failed create log file[%s], exit" LINEFEED, strerror(errno));
         exit(-1);
@@ -158,7 +158,7 @@ void hjk_worker_process_cycle(hjk_conf_t *conf, int i)
     pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_processes[hik_process_slot].fd[0]);
     pthread_detach(t_pipe);
 
-    cap_service(&conf->cap_conf[i], conf->cap_dev, conf->net_dev, conf->net_url, conf->net_mac);
+    cap_service(&conf->cap_conf[i], conf->cap_dev, conf->net_dev, conf->net_mtu, conf->net_url, conf->net_mac);
 }
 
 pid_t hjk_spawn_process(hjk_conf_t *conf, int i)
@@ -267,7 +267,7 @@ int main(int argc, const char *argv[])
         log_error("worker process[%d] shutdown[%s]", pid, WIFEXITED(status) ? "exited" : "unexpected");
     }
 
-    log_error("program unexpected exit!!! All worker process Core");
+    log_error("program unexpected exit!!! all worker process Core");
 
     return 0;
 }

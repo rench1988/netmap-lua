@@ -17,6 +17,7 @@ typedef struct {
     char  *net_dev;
     char  *net_mac;
     char  *net_url;
+    int    net_mtu;
 
     char  *log_file;
     char  *log_level;

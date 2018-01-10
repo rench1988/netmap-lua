@@ -19,6 +19,7 @@
 #define TOKEN_INJECT_DEV    "dev"
 #define TOKEN_INJECT_URL    "pushurl"
 #define TOKEN_INJECT_MAC    "mac"
+#define TOKEN_INJECT_MTU    "mtu"
 
 #define TOKEN_LOG           "log"
 #define TOKEN_LOG_FILE      "file"
@@ -151,6 +152,7 @@ hjk_conf_t *parse_hijack_conf(const char *filename)
         parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_DEV, cJSON_String, &conf->net_dev, NULL) ||
         parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_URL, cJSON_String, &conf->net_url, NULL) ||
         parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_MAC, cJSON_String, &conf->net_mac, NULL) ||
+        parse_hijack_unit(root, TOKEN_INJECT, TOKEN_INJECT_MTU, cJSON_Number, NULL, &conf->net_mtu) ||
         parse_hijack_unit(root, TOKEN_CAPTURE, TOKEN_CAPTURE_DEV, cJSON_String, &conf->cap_dev, NULL) ||
         parse_hijack_cap_proc_array(root, TOKEN_CAPTURE, TOKEN_CAPTURE_PROCS, &conf->cap_conf, &conf->cap_num)) {
         goto failed;

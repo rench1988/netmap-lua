@@ -5,6 +5,8 @@
 #include "log.h"
 #include "http_parser.h"
 #include "util.h"
+#include "https.h"
+#include "inject.h"
 #include <pthread.h>
 #include <pcap/pcap.h>
 #include <stdlib.h>
@@ -23,6 +25,10 @@
 #define DEFAULT_CAP_FILTER      "greater 100 and dst port 80"
 #define DEFAULT_CAP_BUF_SIZE    512 * 1024 * 1024  //512m
 
+#define CAP_HTTP_PORT    80
+#define CAP_HTTPS_PORT   443
+#define CAP_DNS_PORT     53
+
 #define MAX_PACKET_LEN  65535
 
 #define MAX_PACKET_STATUE  1000000
@@ -34,9 +40,7 @@ static const char http_302_str[] = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n"
 
 char pushaddr[MAX_URL_LEN];
 
-uint8_t srcmac[6] = {0};
-
-libnet_t *inet;
+net_inject_t  *nij;
 
 extern int  hik_process_slot;
 
@@ -48,12 +52,19 @@ typedef struct {
     char url[MAX_URL_LEN];
 } cap_url_t;
 
-volatile uint8_t  ether_mac[6];
-
 static int cap_on_headers_complete(http_parser *parser);
 static int cap_header_field_cb(http_parser *parser, const char *buf, size_t len);
 static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len);
 static int cap_url_cb(http_parser *parser, const char *buf, size_t len);
+
+
+static void cap_service_packet_inject_app_rst(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
+                                            struct tcphdr *tcp_hdr);
+static void cap_service_packet_inject_rst(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
+                                        struct tcphdr *tcp_hdr);
+static void cap_service_packet_inject_app(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
+                                      struct tcphdr *tcp_hdr, cap_url_t *url);
+
 
 static http_parser_settings parser_settings = {
     .on_headers_complete = cap_on_headers_complete
@@ -110,179 +121,114 @@ static int cap_url_cb(http_parser *parser, const char *buf, size_t len)
     return 0;
 }
 
-static int cap_service_need_hijack(u_char *http_data, size_t n, cap_url_t *url)
+static void cap_service_http_hijack(u_char *http_data, size_t n,
+                                        struct ether_header *eth_hdr,
+                                        struct iphdr        *ip_hdr,
+                                        struct tcphdr       *tcp_hdr)
 {
     int         parserd;
     http_parser parser;
     char       *pos;
     char        tmp[MAX_URL_LEN];
+    cap_url_t   url;
 
     if (http_data[0] != 'G' && http_data[0] != 'P') {
-        return 0;
+        return;
     }
 
-    memset(url, 0x00, sizeof(cap_url_t));
+    memset(&url, 0x00, sizeof(cap_url_t));
 
     http_parser_init(&parser, HTTP_REQUEST);
-    parser.data = url;
+    parser.data = &url;
     parserd = http_parser_execute(&parser, &parser_settings, (char *)http_data, n);
     if (parserd != n && HTTP_PARSER_ERRNO(&parser) != HPE_CB_header_value) {
-        return 0;
+        return;
     }
 
-    pos = strchr(url->url, '?');
+    pos = strchr(url.url, '?');
     if (pos != NULL) {
         *pos = 0;
     }
 
     memset(tmp, 0x00, sizeof(tmp));
-    snprintf(tmp, MAX_URL_LEN, "%s%s", url->host, url->url);
+    snprintf(tmp, MAX_URL_LEN, "%s%s", url.host, url.url);
 
-    return has_url(tmp);
+    if (!has_url(tmp)) {
+        return; 
+    }
+
+    cap_service_packet_inject_app(eth_hdr, ip_hdr, tcp_hdr, &url);
+    cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);    
+
+    return;
+}
+
+static void cap_service_https_hijack(u_char *https_data, size_t n,
+                                        struct ether_header *eth_hdr,
+                                        struct iphdr        *ip_hdr,
+                                        struct tcphdr       *tcp_hdr,
+                                        uint32_t             tcp_dl)
+{
+    int   ret;
+    char  host[MAX_HOST_LEN];
+
+    ret = parse_tls_header((const char *)https_data, n, host, MAX_HOST_LEN);
+    if (ret <= 0) {
+        return;
+    }
+
+    if (host[ret - 1] != URL_SPLIT && ret < MAX_HOST_LEN - 1) {
+        host[ret] = URL_SPLIT;
+        host[ret + 1] = 0;
+    }
+
+    if (!has_url(host)) {
+        return;
+    }
+
+    cap_service_packet_inject_app_rst(eth_hdr, ip_hdr, tcp_hdr);
+    cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);
+
+    return;
+}
+
+static void cap_service_packet_inject_app_rst(struct ether_header *eth_hdr,
+                                            struct iphdr        *ip_hdr,
+                                            struct tcphdr       *tcp_hdr)
+{
+    if (inject_src_rst(nij, ip_hdr, tcp_hdr)) {
+        log_error("failed send inject rst packet to client[%s]", nij->errbuf);
+    }
+
+    return;    
 }
 
 static void cap_service_packet_inject_rst(struct ether_header *eth_hdr,
                                         struct iphdr        *ip_hdr,
                                         struct tcphdr       *tcp_hdr)
 {
-    libnet_t *inject_net = inet;
-
-	if(libnet_build_tcp(ntohs(tcp_hdr->source),          // sp
-		ntohs(tcp_hdr->dest),                          // dp
-		ntohl(tcp_hdr->seq),                            // seq
-        ntohl(tcp_hdr->ack_seq),                            // ack
-        TH_RST,
-		tcp_hdr->window,                   // win
-		0,                             // sum
-		0,                             // urg
-		LIBNET_TCP_H,                  // len
-		NULL,                          // payload
-		0,                             // paylen
-		inject_net,                    // libnet
-		0) == -1)                      // ptag
-	{
-		goto failed;
+    if (inject_dst_rst(nij, ip_hdr, tcp_hdr)) {
+        log_error("failed send rst to source website[%s]", nij->errbuf);
     }
-    
-	if(libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, // len
-		0,                            // tos
-		ip_hdr->id,                // id
-		0,                            // frag
-		51,							  // ttl
-		IPPROTO_TCP,                  // prot
-		0,                            // sum
-		ip_hdr->saddr,        // src
-		ip_hdr->daddr,        // dst
-		NULL,                         // payload
-		0,                            // paylen
-		inject_net,                   // libnet
-		0) == -1)                     // ptag
-	{
-		goto failed;
-	}    
 
-	if(libnet_build_ethernet((void*) ether_mac,  // dst
-		(void*)srcmac,                           // src
-		ETHERTYPE_IP,                            // prot
-		NULL,                                    // payload
-		0,                                       // paylen
-		inject_net,                              // libnet
-		0) == -1)                                // ptag
-	{
-		goto failed;
-	}
-
-	if(libnet_write(inject_net) == -1) {
-		goto failed;
-	}
-
-    libnet_clear_packet(inject_net);
-    
-    return;
-    
-failed:
-    log_error("failed send rst to source website[%s]", libnet_geterror(inject_net));
-    libnet_clear_packet(inject_net);
     return;
 }
 
 static void cap_service_packet_inject_app(struct ether_header *eth_hdr,
                                       struct iphdr        *ip_hdr,
                                       struct tcphdr       *tcp_hdr,
-                                      uint32_t             tcp_dl,
                                       cap_url_t *url)
 {
     int   inject_len;
     char  inject_packet[2 * MAX_URL_LEN];
-    
-    libnet_t *inject_net = inet;
 
     inject_len = snprintf(inject_packet, 2 * MAX_URL_LEN, "%s%s?domain=%s&uri=%s\r\n\r\n", http_302_str, pushaddr, 
                                     url->host, url->url);
-
-    /*start send payload packet*/
-    if(libnet_build_tcp(ntohs(tcp_hdr->dest),               // sp
-                        ntohs(tcp_hdr->source),               // dp
-                        ntohl(tcp_hdr->ack_seq),                 // seq
-                        ntohl(tcp_hdr->seq) + tcp_dl,        // ack
-#ifdef WITH_FIN
-                        TH_FIN|TH_PUSH|TH_ACK,                  // ctl
-#else
-                        TH_PUSH|TH_ACK,
-#endif
-                        tcp_hdr->window,                             // win
-                        0,                                       // sum
-                        0,                                       // urg
-                        LIBNET_TCP_H + inject_len,	             // len
-                        (uint8_t *)inject_packet,                // payload
-                        inject_len,                              // paylen
-                        inject_net,                              // libnet
-                        0) == -1)                                // ptag    
-    {
-        goto failed;
-    }
-
-	if(libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + inject_len, // len
-		0,                                // tos
-		ip_hdr->id,                    // id
-		0,                                // frag
-		51,							      // ttl
-		IPPROTO_TCP,                      // prot
-		0,                                // sum
-		ip_hdr->daddr,            // src
-		ip_hdr->saddr,            // dst
-		NULL,                             // payload
-		0,                                // paylen
-		inject_net,                       // libnet
-		0) == -1)                         // ptag
-	{
-		goto failed;
-    }
     
-	if(libnet_build_ethernet((void *)ether_mac,   // dst
-		(void *)srcmac,                           // src
-		ETHERTYPE_IP,                             // prot
-		NULL,                                     // payload
-		0,                                        // paylen
-		inject_net,                               // libnet
-		0) == -1)                                 // ptag
-	{
-		goto failed;
-	}
-
-	// Attempt to send.
-	if(libnet_write(inject_net) == -1)
-	{
-        goto failed;
+    if (inject_src_data(nij, ip_hdr, tcp_hdr, (u_char *)inject_packet, inject_len)) {
+        log_error("failed send inject packet to client[%s]", nij->errbuf);
     }
-    
-    libnet_clear_packet(inject_net);
 
-    return;
-
-failed:
-    log_error("failed send inject packet to client[%s]", libnet_geterror(inject_net));
-    libnet_clear_packet(inject_net);
     return;
 }
 
@@ -293,7 +239,7 @@ static void cap_service_working_helper(u_char *raw, struct pcap_pkthdr *pkthdr)
     uint16_t             tcp_dl;
     uint16_t             eth_t;
     size_t               len;
-    cap_url_t            url;
+    //cap_url_t            url;
     struct ether_header *eth_hdr;
     struct iphdr        *ip_hdr;
     struct tcphdr       *tcp_hdr;
@@ -349,17 +295,22 @@ static void cap_service_working_helper(u_char *raw, struct pcap_pkthdr *pkthdr)
 
     if (len <= 0) return;
 
-    if (cap_service_need_hijack(cp, len, &url)) {
-        cap_service_packet_inject_app(eth_hdr, ip_hdr, tcp_hdr, tcp_dl, &url);
-        cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);
+    switch (ntohs(tcp_hdr->dest)) {
+        case CAP_HTTP_PORT:
+            cap_service_http_hijack(cp, len, eth_hdr, ip_hdr, tcp_hdr);
+            break;
+        case CAP_HTTPS_PORT:
+            cap_service_https_hijack(cp, len, eth_hdr, ip_hdr, tcp_hdr, tcp_dl);
+            break;
+        default:
+            break;
     }
 
     return;
 }
 
-static void cap_service_config(pcap_t *pcap, cap_conf_t *conf, char *cap_dev, char *macaddr)
+static void cap_service_config(pcap_t *pcap, cap_conf_t *conf, char *cap_dev)
 {
-    int            ret;
     char           errbuf[PCAP_ERRBUF_SIZE];
     bpf_u_int32    netp;
     bpf_u_int32    mask;
@@ -380,12 +331,6 @@ static void cap_service_config(pcap_t *pcap, cap_conf_t *conf, char *cap_dev, ch
         goto pcap_set_failed;
     }
 
-    ret = sscanf(macaddr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &ether_mac[0], &ether_mac[1], &ether_mac[2], &ether_mac[3], &ether_mac[4], &ether_mac[5]);
-    if (ret != 6) {
-        log_error("failed init packet inject dst mac address");
-        exit(-1);
-    }
-
     return;
 
 pcap_set_failed:
@@ -393,36 +338,31 @@ pcap_set_failed:
     exit(-1);
 }
 
-void cap_service(cap_conf_t *conf, char *cap_dev, char *net_dev, char *pushurl, char *macaddr)
+void cap_service(cap_conf_t *conf, char *cap_dev, char *net_dev, int mtu, char *pushurl, char *macaddr)
 {
     //int            ret;
     uint32_t       pn;
     const u_char  *raw;
-    char           errbuf[PCAP_ERRBUF_SIZE];
+    char           perrbuf[PCAP_ERRBUF_SIZE];
     char           nerrbuf[LIBNET_ERRBUF_SIZE];
     pcap_t        *pcap;
 
     struct pcap_pkthdr   pkthdr;
     struct pcap_stat     ps;
 
-    if (nic_mac(net_dev, srcmac)) {
-        log_error("failed init inject mac address");
-        exit(-1);
-    }
-
-    pcap = pcap_create(cap_dev, errbuf);
+    pcap = pcap_create(cap_dev, perrbuf);
     if (!pcap) {
-        log_error("failed init capture handler, %s", errbuf);
+        log_error("failed init capture handler, %s", perrbuf);
         exit(-1);
     }
 
-    cap_service_config(pcap, conf, cap_dev, macaddr);
+    cap_service_config(pcap, conf, cap_dev);
 
-    inet = libnet_init(LIBNET_LINK, (const char *)net_dev, nerrbuf);
-    if (inet == NULL) {
-        log_error("failed init packet inject interface, %s", nerrbuf);
-        exit(1);
-    }            
+    nij = inject_new(net_dev, macaddr, mtu, nerrbuf, LIBNET_ERRBUF_SIZE);
+    if (nij == NULL) {
+        log_error("failed init injection device, %s", nerrbuf);
+        exit(-1);
+    }        
 
     if (set_pthread_affinity(conf->core)) {
         log_fatal("capture service, failed stick process %d to core %d", hjk_pid, conf->core);
