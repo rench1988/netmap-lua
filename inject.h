@@ -4,7 +4,7 @@
 #include <libnet.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-
+#include <linux/udp.h>
 
 typedef struct {
     libnet_t *l;
@@ -15,6 +15,7 @@ typedef struct {
 
     libnet_ptag_t data_tag;
     libnet_ptag_t tcp_tag;
+    libnet_ptag_t udp_tag;
     libnet_ptag_t ipv4_tag;
     libnet_ptag_t ether_tag;
 
@@ -28,6 +29,8 @@ int inject_dst_rst(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *
 int inject_src_rst(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr);
 int inject_src_data(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr,
                      u_char *data, size_t datalen);
+int inject_src_dns_packet(net_inject_t *injector, struct iphdr *ip_hdr, struct udphdr *udp_hdr,
+                            u_char *data, size_t datalen);                     
 
 #endif
 

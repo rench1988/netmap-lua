@@ -65,18 +65,8 @@ int has_url(const char *url)
 
     memset(tmp, 0x00, sizeof(tmp));
 
-    pos = tmp;
-    if (!strncmp(url, "http://", 7)) {
-        start = (char *)url + 7;
-        memcpy(tmp, url, 7);
-        pos += 7;
-    } else if (!strncmp(url, "https://", 8)) {
-        start = (char *)url + 8;
-        memcpy(tmp, url, 8);
-        pos += 8;
-    } else {
-        start = (char *)url;
-    }
+    pos   = tmp;
+    start = (char *)url;
 
     pthread_rwlock_rdlock(&rwlock);
 

@@ -105,6 +105,7 @@ net_inject_t *inject_new(const char *dev, char *str_mac, uint16_t mtu, char *err
 
     ni->l = l;
     ni->data_tag = LIBNET_PTAG_INITIALIZER;
+    ni->udp_tag = LIBNET_PTAG_INITIALIZER;
     ni->tcp_tag = LIBNET_PTAG_INITIALIZER;
     ni->ipv4_tag = LIBNET_PTAG_INITIALIZER;
     ni->ether_tag = LIBNET_PTAG_INITIALIZER;
@@ -120,6 +121,60 @@ net_inject_t *inject_new(const char *dev, char *str_mac, uint16_t mtu, char *err
 failed:
     snprintf(errbuf, errlen, "%s", lerrbuf);
     return NULL;
+}
+
+int inject_src_dns_packet(net_inject_t *injector, struct iphdr *ip_hdr, struct udphdr *udp_hdr,
+                            u_char *data, size_t datalen)
+{
+    injector->udp_tag = libnet_build_udp(ntohs(udp_hdr->dest),
+                                         ntohs(udp_hdr->source),
+                                         LIBNET_UDP_H + datalen,
+                                         0,
+                                         (uint8_t *)data,
+                                         datalen,
+                                         injector->l,
+                                         injector->udp_tag);
+    if (injector->udp_tag == -1) {
+        goto failed;
+    }
+
+    injector->ipv4_tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_UDP_H + datalen,
+                                            0,
+                                            ip_hdr->id,
+                                            0,
+                                            51,
+                                            IPPROTO_UDP,
+                                            0,
+                                            ip_hdr->daddr,
+                                            ip_hdr->saddr,
+                                            NULL,
+                                            0,
+                                            injector->l,
+                                            injector->ipv4_tag);
+    if (injector->ipv4_tag == -1) {
+        goto failed;
+    }
+
+	injector->ether_tag = libnet_build_ethernet((void *)injector->dmac,  
+		                    (void *)injector->smac,                           
+		                    ETHERTYPE_IP,                             
+		                    NULL,                                    
+		                    0,                                        
+		                    injector->l,                              
+		                    injector->ether_tag);                                
+	if (injector->ether_tag == -1) {
+		goto failed;
+	}
+
+	if(libnet_write(injector->l) == -1) {
+        goto failed;
+    }
+
+    return 0;      
+    
+failed:
+    snprintf(injector->errbuf, LIBNET_ERRBUF_SIZE, "%s", libnet_geterror(injector->l));
+    return -1;
 }
 
 int inject_src_data(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr,
