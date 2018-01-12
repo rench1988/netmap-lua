@@ -62,8 +62,8 @@ static int dns_encode_rr(dns_message_t *msg, char *dst, size_t dstlen)
 
         *((uint16_t *)(dst + cur)) = htons(rr->type);
         *((uint16_t *)(dst + cur + 2)) = htons(rr->class);
-        *((uint32_t *)(dst + cur + 4)) = htons(rr->ttl);
-        *((uint16_t *)(dst + cur + 2)) = htons(rr->datalen);
+        *((uint32_t *)(dst + cur + 4)) = htonl(rr->ttl);
+        *((uint16_t *)(dst + cur + 8)) = htons(rr->datalen);
 
         cur += 10;
         if (dstlen - cur < rr->datalen) {
@@ -92,7 +92,7 @@ static int dns_resp_msg_encode(dns_message_t *msg, char *dst, size_t dstlen)
 
     *(uint16_t *)dst = htons(msg->header.id);
     *(dst + 2) |= 0x80;
-    *(dst + 2) |= 0x40;
+    *(dst + 2) |= 0x04;
     *(dst + 3) &= 0xf0;
 
     *((uint16_t *)(dst + 4)) = htons(msg->header.qdCount);
@@ -158,15 +158,20 @@ static int dns_domain_parse(u_char *data, size_t datalen, char *dst, size_t dstl
     s = 0;
     l = 0;
 
-    for (i = 0; (l = data[i]); i += l + 1) {
-        if (l >= dstlen - s) {
+    while (data[i]) {
+        l = data[i];
+
+        if (l >= dstlen - s - 1) {
             return -1;
         }
         if (s != 0) {
             dst[s++] = '.';
         }
-        memcpy(dst + s, data + i, l);
+
+        ++i;
+        memcpy(dst + s, data + i, l);  
         s += l;
+        i += l;      
     }
 
     dst[s] = 0;
