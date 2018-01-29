@@ -203,29 +203,50 @@ int inject_src_rst(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *
 {
     uint16_t tcp_dl;
 
+#ifndef WITH_RST 
     static const char *data = "hello";
     size_t datalen = 5;
+#endif
 
     tcp_dl = ntohs(ip_hdr->tot_len) - (ip_hdr->ihl * 4) - tcp_hdr->doff * 4;
 
     injector->tcp_tag = libnet_build_tcp(ntohs(tcp_hdr->dest),   
                             ntohs(tcp_hdr->source),                 
                             ntohl(tcp_hdr->ack_seq),                 
-                            ntohl(tcp_hdr->seq) + tcp_dl,            
-                            TH_PUSH|TH_ACK, //TH_RST | TH_ACK | TH_PUSH,
+                            ntohl(tcp_hdr->seq) + tcp_dl,
+#ifdef WITH_RST
+                            TH_ACK|TH_RST,
+#else         
+    #ifdef WITH_FIN
+                            TH_FIN|TH_PUSH|TH_ACK, //TH_RST | TH_ACK | TH_PUSH,
+    #else
+                            TH_PUSH|TH_ACK,
+    #endif
+#endif
                             tcp_hdr->window,                           
                             0,                                       
-                            0,                                       
+                            0,
+#ifdef WITH_RST
+                            LIBNET_TCP_H,
+                            NULL,
+                            0,
+#else                                       
                             LIBNET_TCP_H + datalen,	                        
                             (uint8_t *)data,                                  
-                            datalen,                                    
+                            datalen,
+#endif                                    
                             injector->l,                             
                             injector->tcp_tag); 
     if (injector->tcp_tag == -1) {
         goto failed;
     }
 
-	injector->ipv4_tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + datalen, 
+	injector->ipv4_tag = libnet_build_ipv4(
+#ifdef WITH_RST
+                            LIBNET_IPV4_H + LIBNET_TCP_H,
+#else                             
+                            LIBNET_IPV4_H + LIBNET_TCP_H + datalen, 
+#endif
 		                    0,                                
 		                    ip_hdr->id,                    
 		                    0,                               

@@ -368,7 +368,7 @@ static void cap_service_working_helper(u_char *raw, struct pcap_pkthdr *pkthdr)
     len = len - ETHER_HDR_LEN;
 
 	/* Is PPOE packet*/
-	if (eth_hdr->ether_type == 0x8100) {
+	if (eth_t == 0x8100) {
 		cp = cp + 2;
 
 		if (cp[0] != 0x88 && cp[1] != 0x64)

@@ -10,8 +10,15 @@ AddOption('--with-fin',
           action='store_true',
           help='with-fin')
 
+AddOption('--with-rst',
+          dest='with-rst',
+          default=False,
+          action='store_true',
+          help='with-rst')
+
 with_debug = GetOption('with-debug')
 with_fin = GetOption('with-fin')
+with_rst = GetOption('with-rst')
 
 ccflags = '-Wall -Werror -Wunused-function -Wunused-variable -fno-strict-aliasing'
 
@@ -23,13 +30,16 @@ else:
 if with_fin:
     ccflags += ' -DWITH_FIN'
 
+if with_rst:
+    ccflags += ' -DWITH_RST'
+
 env = Environment(CCFLAGS = ccflags)
 
 lib_path = ['/usr/local/lib']
 libs = ['pthread', 'pcap', 'net', 'm'] + File(['/home/rench/libev/lib/libev.a'])
 cpp_path=['.', '/home/rench/libev/include/']
 
-env.Program(target = 'net-hijack',
+env.Program(target = 'hjk',
 			source = Glob('*.c'),
 			LIBS = libs,
 			LIBPATH = lib_path,
