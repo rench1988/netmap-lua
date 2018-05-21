@@ -4,6 +4,12 @@ AddOption('--with-debug',
           action='store_true',
           help='with-debug')
 
+AddOption('--with-netmap',
+          dest='with-netmap',
+          default=False,
+          action='store_true',
+          help='with-netmap')
+
 AddOption('--with-fin',
           dest='with-fin',
           default=False,
@@ -16,6 +22,7 @@ AddOption('--with-rst',
           action='store_true',
           help='with-rst')
 
+with_netmap = GetOption('with-netmap')
 with_debug = GetOption('with-debug')
 with_fin = GetOption('with-fin')
 with_rst = GetOption('with-rst')
@@ -32,6 +39,9 @@ if with_fin:
 
 if with_rst:
     ccflags += ' -DWITH_RST'
+
+if with_netmap:
+    ccflags += ' -DWITH_NETMAP'
 
 env = Environment(CCFLAGS = ccflags)
 

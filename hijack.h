@@ -7,6 +7,8 @@
 
 #define version   "1.0.0"
 
+#define MAX_PIPE_BODY  (4098 + 2)
+
 typedef struct {
     pid_t  pid;
     int    fd[2];

@@ -19,7 +19,7 @@
 #include "util.h"
 #include "rpc.h"
 #include "capture.h"
-#include "urls.h"
+#include "policy.h"
 
 #define DEFAULT_LOG_FILE  "hijack.log"
 #define DEFAULT_LOG_LEVEL "INFO"
@@ -74,11 +74,6 @@ int hjk_worker_process_pipe_msg(char *buf, int n)
 {
     static const char sp = '\n';
 
-    enum {
-        add = 1,
-        del
-    };
-
     int   tn = n;
     char *start, *end;
     char  tmp[MAX_PIPE_BUF_SIZE];
@@ -92,13 +87,21 @@ int hjk_worker_process_pipe_msg(char *buf, int n)
         *(tmp + (end - start - 1)) = 0;
 
         switch (*start - '0') {
-            case add:
+            case uadd:
                 log_debug("process %d receive url[%s] add cmd", hjk_pid, tmp);
-                add_url(tmp);
+                policy_add_url(tmp);
                 break;
-            case del:
+            case udel:
                 log_debug("process %d receive url[%s] del cmd", hjk_pid, tmp);
-                del_url(tmp);
+                policy_del_url(tmp);
+                break;
+            case iadd:
+                log_debug("process %d receive ip[%s] add cmd", hjk_pid, tmp);
+                policy_add_ip(tmp);
+                break;
+            case idel:
+                log_debug("process %d receive ip[%s] del cmd", hjk_pid, tmp);
+                policy_del_ip(tmp);
                 break;
             default:
                 break;

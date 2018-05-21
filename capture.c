@@ -1,13 +1,14 @@
 #include "capture.h"
 #include "conf.h"
 #include "lkf_queue.h"
-#include "urls.h"
+#include "policy.h"
 #include "log.h"
 #include "http_parser.h"
 #include "util.h"
 #include "https.h"
 #include "inject.h"
 #include "dns.h"
+#include "gtpu.h"
 #include <pthread.h>
 #include <pcap/pcap.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #define CAP_HTTP_PORT    80
 #define CAP_HTTPS_PORT   443
 #define CAP_DNS_PORT     53
+#define CAP_GTP_PORT     2152
 
 #define MAX_PACKET_LEN  65535
 
@@ -58,7 +60,12 @@ static int cap_header_field_cb(http_parser *parser, const char *buf, size_t len)
 static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len);
 static int cap_url_cb(http_parser *parser, const char *buf, size_t len);
 
-
+static void cap_service_working_udp(u_char *cp, size_t len,
+                                    struct ether_header *eth_hdr,
+                                    struct iphdr        *ip_hdr);
+static void cap_service_working_tcp(u_char *cp, size_t len,
+                                    struct ether_header *eth_hdr,
+                                    struct iphdr        *ip_hdr);
 static void cap_service_packet_inject_app_rst(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
                                             struct tcphdr *tcp_hdr);
 static void cap_service_packet_inject_rst(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
@@ -158,12 +165,14 @@ static void cap_service_http_hijack(u_char *http_data, size_t n,
     memset(tmp, 0x00, sizeof(tmp));
     snprintf(tmp, MAX_URL_LEN, "%s%s", url.host, url.url);
 
-    if (!has_url(tmp)) {
+    log_debug("http cap: %s", tmp);
+
+    if (!policy_url_meet(tmp)) {
         return; 
     }
 
     cap_service_packet_inject_app(eth_hdr, ip_hdr, tcp_hdr, &url);
-    cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);    
+    //cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);    
 
     return;
 }
@@ -186,14 +195,56 @@ static void cap_service_https_hijack(u_char *https_data, size_t n,
         host[ret + 1] = 0;
     }
 
-    if (!has_url(host)) {
+    log_debug("https cap: %s", host);
+
+    if (!policy_url_meet(host)) {
         return;
     }
 
     cap_service_packet_inject_app_rst(eth_hdr, ip_hdr, tcp_hdr);
-    cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);
+    //cap_service_packet_inject_rst(eth_hdr, ip_hdr, tcp_hdr);
 
     return;
+}
+
+static void cap_service_gtp_hijack(u_char *data, size_t len, struct ether_header *eth_hdr)
+{
+    int             parsered;
+    struct iphdr   *ip_hdr;
+    gtpuHdr_t       gtp_hdr;
+
+    parsered = gtpu_header_parse(data, len, &gtp_hdr);
+    if (parsered == -1) {
+        return;
+    }
+
+    len -= parsered;
+    data += parsered;
+
+    if (gtp_hdr.msg_type != 0xff || 
+        len <= sizeof(struct iphdr) + sizeof(struct tcphdr)) {
+        return;
+    }
+
+    ip_hdr = (struct iphdr *)data;
+    if (ip_hdr->version != 4) {
+        return; 
+    }   
+
+    data += (ip_hdr->ihl * 4);
+    len -= (ip_hdr->ihl * 4);
+
+    switch (ip_hdr->protocol) {
+        case IPPROTO_TCP:
+            cap_service_working_tcp(data, len, eth_hdr, ip_hdr);
+            break;
+        case IPPROTO_UDP:
+            cap_service_working_udp(data, len, eth_hdr, ip_hdr);
+            break;
+        default:
+            return;
+    }     
+
 }
 
 static void cap_service_dns_hijack(u_char *data, size_t len,
@@ -212,7 +263,7 @@ static void cap_service_dns_hijack(u_char *data, size_t len,
 
     qs = msg.questions;
     while (qs != NULL) {
-        if (has_url(qs->name) && qs->type == dns_rr_a) {
+        if (policy_url_meet(qs->name) && qs->type == dns_rr_a) {
             cap_service_packet_inject_dns(ip_hdr, udp_hdr, &msg, qs);
             break;
         }
@@ -288,7 +339,6 @@ static void cap_service_working_tcp(u_char *cp, size_t len,
                                     struct ether_header *eth_hdr,
                                     struct iphdr        *ip_hdr)
 {
-    uint16_t             tcp_dl;
     uint8_t              tcp_hl;
     struct tcphdr       *tcp_hdr;
 
@@ -296,12 +346,15 @@ static void cap_service_working_tcp(u_char *cp, size_t len,
 
     tcp_hdr = (struct tcphdr *)cp;
     tcp_hl = tcp_hdr->doff * 4;
-    tcp_dl = ntohs(ip_hdr->tot_len) - (ip_hdr->ihl * 4) - tcp_hl;
 
     cp = cp + tcp_hl;
     len = len - tcp_hl;
 
     if (len <= 0) {
+        return;
+    }
+
+    if (!policy_ip_meet(ip_hdr->saddr)) {
         return;
     }
 
@@ -333,14 +386,21 @@ static void cap_service_working_udp(u_char *cp, size_t len,
 
     udp_hdr = (struct udphdr *)cp;
 
-    if (ntohs(udp_hdr->dest) != CAP_DNS_PORT) {
-        return;
-    }
-
     cp += udp_header_size;
     len -= udp_header_size;
 
-    cap_service_dns_hijack(cp, len, eth_hdr, ip_hdr, udp_hdr);
+    if (ntohs(udp_hdr->len) != len + udp_header_size) {
+        return;
+    }
+
+    switch (ntohs(udp_hdr->dest)) {
+    case CAP_DNS_PORT:
+        cap_service_dns_hijack(cp, len, eth_hdr, ip_hdr, udp_hdr);
+    case CAP_GTP_PORT:
+        cap_service_gtp_hijack(cp, len, eth_hdr);
+    default:
+        return;
+    }
 
     return;
 }
@@ -484,7 +544,7 @@ void cap_service(cap_conf_t *conf, char *cap_dev, char *net_dev, int mtu, char *
 
         if (pn > MAX_PACKET_STATUE) {
             pcap_stats(pcap, &ps);
-            log_info("[%d]capture status: %d(ps_recv)  %d(ps_drop)  %d(ps_ifdrop)", hjk_pid, ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+            //log_debug("[%d]capture status: %d(ps_recv)  %d(ps_drop)  %d(ps_ifdrop)", hjk_pid, ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
             pn = 0;
         }
 	}    

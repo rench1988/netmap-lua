@@ -155,6 +155,7 @@ static int dns_domain_parse(u_char *data, size_t datalen, char *dst, size_t dstl
 {
     int i, s, l;
 
+    i = 0;
     s = 0;
     l = 0;
 

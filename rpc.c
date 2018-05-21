@@ -5,7 +5,7 @@
 #include "http_parser.h"
 #include "cJSON.h"
 #include "sock.h"
-#include "urls.h"
+#include "policy.h"
 #include "hijack.h"
 #include <ev.h>
 #include <errno.h>
@@ -21,14 +21,9 @@
 #define RPC_MAX_BODY  4089
 
 #define RPC_TYPE_TOKEN  "type"
-#define RPC_URLS_TOKEN  "urls"
+#define RPC_POLICY_TOKEN  "policy"
 
 #define MAX_PROC_FD   1024
-
-typedef enum {
-    uadd = 1,
-    udel
-} utype;
 
 struct ev_loop *rpc_loop;
 
@@ -138,7 +133,7 @@ static void rpc_req_response(rpc_connection_t *conn)
     size_t  n = 0;
 
     s = sock_write(conn->fd, send_response, send_len, &n);
-    if (n != send_len) {
+    if (s != OK || n != send_len) {
         log_error("rpc request[client %s] send response failed", conn->addr);
     }
 
@@ -163,7 +158,7 @@ static void rpc_req_process(rpc_connection_t *conn)
     int    i, n;
     int    type;
     cJSON *root, *unode;
-    char   buf[MAX_URL_LEN + 2];
+    char   buf[MAX_PIPE_BODY];
 
     root = cJSON_Parse(conn->body);
     if (!root) {
@@ -172,14 +167,14 @@ static void rpc_req_process(rpc_connection_t *conn)
     }
     
     type = rpc_req_type(root);
-    if (type != uadd && type != udel) {
+    if (type < uadd || type > idel) {
         log_error("rpc request[client %s] body data with bad type", conn->addr);
         goto failed;
     }
 
-    unode = cJSON_GetObjectItemCaseSensitive(root, RPC_URLS_TOKEN);
+    unode = cJSON_GetObjectItemCaseSensitive(root, RPC_POLICY_TOKEN);
     if (!unode || unode->type != cJSON_Array) {
-        log_error("rpc request[client %s] body data with bad urls array", conn->addr);
+        log_error("rpc request[client %s] body data with bad elems array", conn->addr);
         goto failed;
     }
 
@@ -189,13 +184,9 @@ static void rpc_req_process(rpc_connection_t *conn)
             continue;
         }
 
-        if (type == uadd) {
-            buf[0] = '1';
-        } else {
-            buf[0] = '2';
-        }
+        buf[0] = type + '0';
 
-        n = snprintf(buf + 1, MAX_URL_LEN - 1, "%s\n", subitem->valuestring);
+        n = snprintf(buf + 1, MAX_PIPE_BODY - 1, "%s\n", subitem->valuestring);
 
         rpc_pipe_msg(buf, n + 1);
     }
