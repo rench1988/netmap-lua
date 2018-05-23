@@ -59,19 +59,6 @@ void log_set_level(int level) {
   L.level = level;
 }
 
-void log_set_str_level(const char *level) {
-    int i;
-
-    for (i = LOG_TRACE; i < LOG_FATAL + 1; i++) {
-        if (!strcasecmp(level_names[i], level)) {
-            log_set_level(i);
-            return;
-        }
-    }
-
-    log_set_level(LOG_INFO);
-}
-
 void log_set_quiet(int enable) {
   L.quiet = enable ? 1 : 0;
 }

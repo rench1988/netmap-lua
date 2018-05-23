@@ -3,15 +3,18 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <net/ethernet.h>
 
 #define  LINEFEED    "\n"
 
-char *load_file(const char *filename);
 int mkpath(char* file_path, mode_t mode);
 int daemonize(void);
-int turn_on_core(void);
-int set_pthread_affinity(int core);
-int nic_mac(char *ethname, uint8_t *srcmac);
+
+int setrlimit_core(void);
+int setaffinity(pthread_t me, int i);
+
+int hwaddr_mac(const char *ifname, struct ether_addr *buf);
+
 void initproctitle(int argc, char **argv);
 void setproctitle(const char *prog, const char *txt);
 char *cpystrn(char *dst, char *src, size_t n);

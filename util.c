@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,8 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 #include "util.h"
 
 #define path_split  '/'
@@ -21,33 +24,14 @@
 #define SPT_BUFSIZE     2048
 #endif
 
+#define cpuset_t cpu_set_t
+
 extern char **environ;
 
 static char **argv0;
 static int    argv_lth;
 
-char *load_file(const char *filename)
-{
-    char  *buffer = NULL;
-    long   length;
-    FILE  *f = fopen(filename, "rb");
-    
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        length = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        buffer = calloc(1, length);
-        if (buffer) {
-            fread(buffer, 1, length, f);
-        }
-        fclose(f);
-    }
-
-    return buffer;
-}
-
-int mkpath(char* file_path, mode_t mode) 
-{
+int mkpath(char* file_path, mode_t mode) {
     char* p;
     
     for (p = strchr(file_path + 1, path_split); p; p = strchr(p + 1, path_split)) {
@@ -59,6 +43,19 @@ int mkpath(char* file_path, mode_t mode)
     }
 
     return 0;
+}
+
+int hwaddr_mac(const char *ifname, struct ether_addr *buf) {
+    struct ifreq s;
+    int fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP);
+
+    strcpy(s.ifr_name, ifname);
+    if (0 == ioctl(fd, SIOCGIFHWADDR, &s)) {
+        memcpy(buf, s.ifr_addr.sa_data, 6);
+        return 0;
+    }
+
+    return -1;
 }
 
 int daemonize(void)
@@ -113,8 +110,7 @@ int daemonize(void)
     return 0;
 }
 
-int turn_on_core(void)
-{
+int setrlimit_core(void) {
     struct rlimit core_limit;
     
     core_limit.rlim_cur = RLIM_INFINITY;
@@ -123,40 +119,20 @@ int turn_on_core(void)
     return setrlimit(RLIMIT_CORE, &core_limit);
 }
 
-int set_pthread_affinity(int core) 
-{
-   int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-   if (core < 0 || core >= num_cores)
-      return EINVAL;
+int setaffinity(pthread_t me, int i) {
+    cpuset_t cpumask;
 
-   cpu_set_t cpuset;
-   CPU_ZERO(&cpuset);
-   CPU_SET(core, &cpuset);
+    if (i == -1)
+        return 0;
 
-   pthread_t current_thread = pthread_self();    
-   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-}
+    /* Set thread affinity affinity.*/
+    CPU_ZERO(&cpumask);
+    CPU_SET(i, &cpumask);
 
-int nic_mac(char *ethname, uint8_t *srcmac)
-{
-    int                 sockfd;  
-    struct ifreq        ifr;  
-      
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);  
-    if (sockfd == -1) {  
-        return -1;
-    }  
-      
-    strcpy(ifr.ifr_name, ethname);
-
-    if (ioctl(sockfd, SIOCGIFHWADDR, &ifr)) {
-        return -1;
+    if (pthread_setaffinity_np(me, sizeof(cpuset_t), &cpumask) != 0) {
+        printf("unable to set affinity: %s", strerror(errno));
+        return 1;
     }
-
-    memcpy(srcmac, ifr.ifr_hwaddr.sa_data, 6);
-
-    close(sockfd);
-
     return 0;
 }
 
@@ -209,8 +185,7 @@ void setproctitle(const char *prog, const char *txt)
     argv0[1] = NULL;
 }
 
-char *cpystrn(char *dst, char *src, size_t n)
-{
+char *cpystrn(char *dst, char *src, size_t n) {
     if (n == 0) {
         return dst;
     }

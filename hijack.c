@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
-#include "conf.h"
+#include <netinet/ether.h>
 #include "log.h"
 #include "hijack.h"
 #include "util.h"
@@ -21,11 +21,12 @@
 #include "capture.h"
 #include "policy.h"
 
-#define DEFAULT_LOG_FILE  "hijack.log"
-#define DEFAULT_LOG_LEVEL "INFO"
+#define HIJACK_LOG_FILE  "hjk.log"
 
 #define MAX_PIPE_BUF_SIZE  4089
 
+const char http_302_str[] = "http://www.lljjsy.com/";
+const char version[] = "2.0.0";
 const char build_time[] = __DATE__ " " __TIME__;
 
 static u_char  program[] = "hjk";
@@ -36,37 +37,36 @@ pid_t   hjk_pid;
 
 int            hjk_process_num;
 int            hik_process_slot;
-hjk_process_t  hjk_processes[HJK_MAX_PROCESSES];
+hjk_process_t  hjk_process;
 
 void helper(void)
 {
     printf("net-hijack version: %s built at %s" LINEFEED, version, build_time);
-    printf("Usage: net-hijack [-?hc] [-c filename]" LINEFEED 
+    printf("Usage: net-hijack [-?haioD]" LINEFEED 
             LINEFEED
             "Options:" LINEFEED 
-            "  -?,-h         : this help" LINEFEED
-            "  -c filename   : set configuration file" LINEFEED);
+            "  -?,-h            : this help" LINEFEED
+            "  -a cpu id	    : use setaffinity" LINEFEED
+            "  -i interface     : set capture interface" LINEFEED
+            "  -o interface     : set inject interface" LINEFEED
+            "  -D mac           : set inject mac address" LINEFEED
+            "  -l address       : rpc listen address" LINEFEED
+            "  -p port          : rpc listen port" LINEFEED
+            "  -P http location : http 302 redirect location" LINEFEED);
 }
 
-void hjk_log_init(hjk_conf_t *conf)
+void hjk_log_init(int debug)
 {
-    int   ret;
     FILE *fp;
 
-    ret = mkpath(conf->log_file, S_IRWXU);
-    if (ret) {
-        printf("failed create log directory[%s], exit" LINEFEED, strerror(errno));
-        exit(-1);
-    }
-
-    fp = fopen(conf->log_file == NULL ? DEFAULT_LOG_FILE : conf->log_file, "a");
+    fp = fopen(HIJACK_LOG_FILE, "w");
     if (!fp) {
         printf("failed create log file[%s], exit" LINEFEED, strerror(errno));
         exit(-1);
     }
 
     log_set_fp(fp);
-    log_set_str_level(conf->log_level == NULL ? DEFAULT_LOG_LEVEL : conf->log_level);
+    log_set_level(debug ? LOG_DEBUG : LOG_INFO);
     log_set_quiet(1);
 }
 
@@ -88,19 +88,19 @@ int hjk_worker_process_pipe_msg(char *buf, int n)
 
         switch (*start - '0') {
             case uadd:
-                log_debug("process %d receive url[%s] add cmd", hjk_pid, tmp);
+                log_info("process %d receive url[%s] add cmd", hjk_pid, tmp);
                 policy_add_url(tmp);
                 break;
             case udel:
-                log_debug("process %d receive url[%s] del cmd", hjk_pid, tmp);
+                log_info("process %d receive url[%s] del cmd", hjk_pid, tmp);
                 policy_del_url(tmp);
                 break;
             case iadd:
-                log_debug("process %d receive ip[%s] add cmd", hjk_pid, tmp);
+                log_info("process %d receive ip[%s] add cmd", hjk_pid, tmp);
                 policy_add_ip(tmp);
                 break;
             case idel:
-                log_debug("process %d receive ip[%s] del cmd", hjk_pid, tmp);
+                log_info("process %d receive ip[%s] del cmd", hjk_pid, tmp);
                 policy_del_ip(tmp);
                 break;
             default:
@@ -144,31 +144,29 @@ void *hjk_worker_listen_pipe(void *arg)
     return NULL;
 }
 
-void hjk_worker_process_cycle(hjk_conf_t *conf, int i)
+void hjk_worker_process_cycle(hjk_conf_t *conf)
 {
     pthread_t  t_pipe;
 
     setproctitle((char *)program, (char *)worker_process);
 
-    hik_process_slot = i;
-
     hjk_pid = getpid();
 
-    log_info("worker process[%d] for %s start to running...", hjk_pid, conf->cap_conf[i].filter);
+    log_info("worker process[%d] start to running...", hjk_pid);
 
-    close(hjk_processes[hik_process_slot].fd[1]);
+    close(hjk_process.fd[1]);
 
-    pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_processes[hik_process_slot].fd[0]);
+    pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_process.fd[0]);
     pthread_detach(t_pipe);
 
-    cap_service(&conf->cap_conf[i], conf->cap_dev, conf->net_dev, conf->net_mtu, conf->net_url, conf->net_mac);
+    cap_service(conf);
 }
 
-pid_t hjk_spawn_process(hjk_conf_t *conf, int i)
+pid_t hjk_spawn_process(hjk_conf_t *conf)
 {
     pid_t pid;
 
-    if (pipe(hjk_processes[i].fd)) {
+    if (pipe(hjk_process.fd)) {
         goto failed;
     }
 
@@ -178,7 +176,7 @@ pid_t hjk_spawn_process(hjk_conf_t *conf, int i)
         case -1: 
             goto failed;
         case 0: 
-            hjk_worker_process_cycle(conf, i);
+            hjk_worker_process_cycle(conf);
         default:
             break;
     }   
@@ -192,22 +190,16 @@ failed:
 
 void hjk_master_process_cycle(hjk_conf_t *conf)
 {
-    int        i;
     pid_t      pid;
     pthread_t  tid;
 
     setproctitle((char *)program, (char *)master_process);
 
-    hjk_process_num = conf->cap_num;
-
-    for (i = 0; i < conf->cap_num; i++) {
-        pid = hjk_spawn_process(conf, i);
+    pid = hjk_spawn_process(conf);
         
-        close(hjk_processes[i].fd[0]);
+    close(hjk_process.fd[0]);
 
-        hjk_processes[i].pid   = pid;
-        hjk_processes[i].index = i;
-    }
+    hjk_process.pid   = pid;
 
     pthread_create(&tid, NULL, rpc_service, conf);
     pthread_detach(tid);
@@ -219,19 +211,50 @@ int main(int argc, const char *argv[])
     int             status;
     int             debug;
     pid_t           pid;
-    char           *conf_file;
-    hjk_conf_t     *conf;
+    hjk_conf_t      conf;
+
+    struct ether_addr *e;
 
     debug = 0;
-    conf_file = NULL;
 
-    while ((opt = getopt(argc, (char * const*)argv, "c:hd")) != -1) {
+    bzero(&conf, sizeof(conf));
+
+    while ((opt = getopt(argc, (char * const*)argv, "i:o:a:D:C:l:p:P:dh")) != -1) {
         switch (opt) {
-            case 'c':
-                conf_file = strdup(optarg);
+            case 'i':
+                sprintf(conf.iether, "netmap:%s", optarg);    
+                break;
+            case 'o':
+                sprintf(conf.oether, "netmap:%s", optarg);
+                break;
+            case 'a':
+                conf.affinity = atoi(optarg);
+                break;
+            case 'D':
+                e = ether_aton(optarg);
+                if (e == NULL) {
+                    printf("invalid MAC address '%s'\n", optarg);
+                    return 1;                    
+                }
+                bcopy(e, &conf.dst_mac, 6);
                 break;
             case 'd':
                 debug = 1;
+                break;
+            case 'C':
+                conf.nmr = optarg;
+                break;
+            case 'l':
+                conf.laddr = optarg;
+                break;
+            case 'p':
+                conf.lport = atoi(optarg);
+                break;
+            case 'b':
+                conf.burst = atoi(optarg);
+                break;
+            case 'P':
+                conf.http_302_str = optarg;
                 break;
             case 'h':
             case '?':
@@ -242,35 +265,39 @@ int main(int argc, const char *argv[])
         }
     }
 
-    if (conf_file == NULL) {
-        printf("must assign configuration file" LINEFEED);
+    if (strlen(conf.iether) == 0 || strlen(conf.oether) == 0) {
+        printf("capture or inject interface can't be null" LINEFEED);
         exit(0);
     }
 
-    conf = parse_hijack_conf(conf_file);
-    if (!conf) {
-        exit(-1);
+    if (conf.laddr == NULL || conf.lport == 0) {
+        printf("rpc service information can't be null" LINEFEED);
+        exit(0);
     }
 
-    print_all_conf(conf);
+    if (conf.http_302_str == NULL) {
+        conf.http_302_str = http_302_str;
+    }
 
-    hjk_log_init(conf);
+    hwaddr_mac(conf.oether, &conf.src_mac);
+
+    hjk_log_init(debug);
 
     printf("program start..." LINEFEED);
 
     initproctitle(argc, (char **)argv);
 
-    if (!debug) daemonize();
+    daemonize();
 
-    turn_on_core();
+    setrlimit_core();
 
-    hjk_master_process_cycle(conf);
+    hjk_master_process_cycle(&conf);
 
     while ((pid = waitpid(-1, &status, 0)) != -1) {
         log_error("worker process[%d] shutdown[%s]", pid, WIFEXITED(status) ? "exited" : "unexpected");
     }
 
-    log_error("program unexpected exit!!! all worker process Core");
+    log_error("program unexpected exit");
 
     return 0;
 }

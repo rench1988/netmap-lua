@@ -47,7 +47,7 @@ env = Environment(CCFLAGS = ccflags)
 
 lib_path = ['/usr/local/lib']
 libs = ['pthread', 'pcap', 'net', 'm'] + File(['/home/rench/libev/lib/libev.a'])
-cpp_path=['.', '/home/rench/libev/include/']
+cpp_path=['/root/netmap-11.3/sys/', '.', '/home/rench/libev/include/']
 
 env.Program(target = 'hjk',
 			source = Glob('*.c'),

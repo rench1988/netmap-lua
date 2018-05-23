@@ -1,9 +1,9 @@
 #ifndef __capture_h__
 #define __capture_h__
 
-#include "conf.h"
+#include "hijack.h"
 
-void cap_service(cap_conf_t *conf, char *cap_dev, char *net_dev, int net_mtu, char *pushurl, char *macaddr);
+void cap_service(hjk_conf_t *conf);
 
 #endif
 

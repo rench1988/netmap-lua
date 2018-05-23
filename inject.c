@@ -1,344 +1,230 @@
 #include "inject.h"
+#include "log.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/netmap.h>
+#define NETMAP_WITH_LIBS
+#include <net/netmap_user.h>
 
-#define NET_INJECT_MIN_MTU          552 
-#define NET_INJECT_MAX_HEADER_SIZE  40
+#define MAX_PKT_SIZE  16384
 
-static int inject_src_one_packet(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr,
-                                    u_char *data, size_t datalen, size_t offset)
-{
-    int      size;
-    uint16_t tcp_dl;
+/* Compute the checksum of the given ip header. */
+static uint32_t checksum(const void *data, uint16_t len, uint32_t sum) {
+    const uint8_t *addr = data;
+    uint32_t i;
 
-    size = LIBNET_IPV4_H + LIBNET_TCP_H + datalen;
-    tcp_dl = ntohs(ip_hdr->tot_len) - (ip_hdr->ihl * 4) - tcp_hdr->doff * 4;
-
-    injector->tcp_tag = libnet_build_tcp(ntohs(tcp_hdr->dest),                       /* source port	        */
-                                         ntohs(tcp_hdr->source),                     /* dest port	        */
-                                         ntohl(tcp_hdr->ack_seq) + offset,           /* seq number	        */
-                                         ntohl(tcp_hdr->seq) + tcp_dl,               /* ack number	        */
-#ifdef WITH_FIN        
-                                         TH_FIN|TH_PUSH|TH_ACK,                      /* control	            */ 
-#else
-                                         TH_PUSH|TH_ACK,
-#endif
-                                         tcp_hdr->window,                            /* window		        */
-                                         0,                                          /* checksum TBD        */
-                                         0,                                          /* urgent?	            */
-                                         LIBNET_TCP_H + datalen,                     /* TCP PDU size        */
-                                         data,				                         /* data		        */
-                                         datalen,	          			             /* datasize	        */
-                                         injector->l,                                /* libnet context      */
-                                         injector->tcp_tag);                         /* libnet protocol tag */
-    if (injector->tcp_tag == -1) {
-        goto failed;
+    /* Checksum all the pairs of bytes first... */
+    for (i = 0; i < (len & ~1U); i += 2) {
+        sum += (u_int16_t)ntohs(*((u_int16_t *)(addr + i)));
+        if (sum > 0xFFFF)
+            sum -= 0xFFFF;
     }
-
-    injector->ipv4_tag = libnet_build_ipv4(size,                  /* total packet len	   */
-                                           0,                     /* tos			       */
-                                           ip_hdr->id,            /* id			           */
-                                           0,                     /* frag			       */
-                                           51,                    /* ttl			       */
-                                           IPPROTO_TCP,           /* proto		           */
-                                           0,                     /* checksum TBD          */
-                                           ip_hdr->daddr,         /* saddr		           */
-                                           ip_hdr->saddr,         /* daddr		           */
-                                           NULL,    			  /* data			       */
-                                           0,      				  /* datasize?	           */
-                                           injector->l,           /* libnet context        */
-                                           injector->ipv4_tag);   /* libnet protocol tag   */
-    if (injector->ipv4_tag == -1) {
-        goto failed;
+    /*
+     * If there's a single byte left over, checksum it, too.
+     * Network byte order is big-endian, so the remaining byte is
+     * the high byte.
+     */
+    if (i < len) {
+        sum += addr[i] << 8;
+        if (sum > 0xFFFF)
+            sum -= 0xFFFF;
     }
-
-    injector->ether_tag = libnet_build_ethernet((void *)injector->dmac,     // dst
-                                                (void *)injector->smac,     // src
-                                                ETHERTYPE_IP,               // prot
-                                                NULL,                       // payload
-                                                0,                          // paylen
-                                                injector->l,                // libnet
-                                                injector->ether_tag);       // ptag
-    if (injector->ether_tag == -1) {
-        goto failed;
-    } 
-
-	if(libnet_write(injector->l) == -1) {
-        goto failed;
-    }    
-
-    return 0;
-
-failed:
-    snprintf(injector->errbuf, LIBNET_ERRBUF_SIZE, "%s", libnet_geterror(injector->l));
-    return -1;
+    return sum;
 }
 
-net_inject_t *inject_new(const char *dev, char *str_mac, uint16_t mtu, char *errbuf, size_t errlen)
-{
-    int                       length;
-    uint8_t                  *dmacaddr;
-    char                      lerrbuf[LIBNET_ERRBUF_SIZE];
-    libnet_t                 *l;
-    net_inject_t             *ni;
-    struct libnet_ether_addr *mac_addr;
-
-    l = libnet_init(LIBNET_LINK_ADV, dev, lerrbuf);
-    if (l == NULL) {
-        goto failed;
-    }
-
-    mtu = mtu < NET_INJECT_MIN_MTU ? NET_INJECT_MIN_MTU : mtu;
-
-    ni = (net_inject_t *)calloc(1, sizeof(net_inject_t));
-
-    mac_addr = libnet_get_hwaddr(l);
-
-    dmacaddr = libnet_hex_aton(str_mac, &length);
-    if (dmacaddr == NULL) {
-        snprintf(lerrbuf, LIBNET_ERRBUF_SIZE, "mac address[%s] is illegal", str_mac);
-        goto failed;
-    }
-
-    ni->l = l;
-    ni->data_tag = LIBNET_PTAG_INITIALIZER;
-    ni->udp_tag = LIBNET_PTAG_INITIALIZER;
-    ni->tcp_tag = LIBNET_PTAG_INITIALIZER;
-    ni->ipv4_tag = LIBNET_PTAG_INITIALIZER;
-    ni->ether_tag = LIBNET_PTAG_INITIALIZER;
-    ni->mss = mtu - NET_INJECT_MAX_HEADER_SIZE;
-
-    memcpy(ni->smac, mac_addr->ether_addr_octet, 6);
-    memcpy(ni->dmac, dmacaddr, 6);
-
-    free(dmacaddr);
-
-    return ni;
-
-failed:
-    snprintf(errbuf, errlen, "%s", lerrbuf);
-    return NULL;
+static uint16_t wrapsum(uint32_t sum) {
+    sum = ~sum & 0xFFFF;
+    return (htons(sum));
 }
 
-int inject_src_dns_packet(net_inject_t *injector, struct iphdr *ip_hdr, struct udphdr *udp_hdr,
-                            u_char *data, size_t datalen)
+static u_char *inject_fill_2lay_data(u_char *buf, struct ether_addr *src, struct ether_addr *dst)
 {
-    injector->udp_tag = libnet_build_udp(ntohs(udp_hdr->dest),
-                                         ntohs(udp_hdr->source),
-                                         LIBNET_UDP_H + datalen,
-                                         0,
-                                         (uint8_t *)data,
-                                         datalen,
-                                         injector->l,
-                                         injector->udp_tag);
-    if (injector->udp_tag == -1) {
-        goto failed;
-    }
+    struct ether_header *eh = (struct ether_header *)buf;
 
-    injector->ipv4_tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_UDP_H + datalen,
-                                            0,
-                                            ip_hdr->id,
-                                            0,
-                                            51,
-                                            IPPROTO_UDP,
-                                            0,
-                                            ip_hdr->daddr,
-                                            ip_hdr->saddr,
-                                            NULL,
-                                            0,
-                                            injector->l,
-                                            injector->ipv4_tag);
-    if (injector->ipv4_tag == -1) {
-        goto failed;
-    }
+    bcopy(src, eh->ether_shost, 6);
+    bcopy(dst, eh->ether_dhost, 6);
 
-	injector->ether_tag = libnet_build_ethernet((void *)injector->dmac,  
-		                    (void *)injector->smac,                           
-		                    ETHERTYPE_IP,                             
-		                    NULL,                                    
-		                    0,                                        
-		                    injector->l,                              
-		                    injector->ether_tag);                                
-	if (injector->ether_tag == -1) {
-		goto failed;
-	}
+    eh->ether_type = htons(ETHERTYPE_IP);
 
-	if(libnet_write(injector->l) == -1) {
-        goto failed;
-    }
+    return buf + sizeof(struct ether_header);
+}
 
-    return 0;      
+static u_char *inject_fill_3lay_data(u_char *buf, struct iphdr *ip_hdr, int pkt_len, int protocol)
+{
+    struct iphdr  *ip = (struct iphdr *)buf;
+
+    ip->version = IPVERSION;
+    ip->ihl = sizeof(*ip) >> 2;
+    ip->id = 0;
+    ip->tos = IPTOS_LOWDELAY;
+    ip->tot_len = ntohs(pkt_len - sizeof(struct ether_header));
+    ip->frag_off = htons(0x4000); /* Don't fragment */
+    ip->ttl = IPDEFTTL;
+    ip->protocol   = protocol;
+    ip->daddr = ip_hdr->saddr;
+    ip->saddr = ip_hdr->daddr;
+    ip->check = wrapsum(checksum(ip, sizeof(*ip), 0));
+
+    return buf + sizeof(struct iphdr);
+}
+
+static u_char *inject_fill_udp_data(u_char *buf, struct udphdr *udp_hdr, 
+                    u_char *app_data, int app_len)
+{
+    struct udphdr *udp = (struct udphdr *)buf;
+    struct iphdr  *ip;
+
+    ip = (struct iphdr *)(buf - sizeof(*ip));
+
+    udp->source = udp_hdr->dest;
+    udp->dest = udp_hdr->source;
+    udp->len = htons(app_len + sizeof(struct udphdr));    
+
+    udp->check = wrapsum(checksum(
+        udp, sizeof(*udp),       /* udp header */
+        checksum(app_data, /* udp payload */
+                 app_len,
+                 checksum(&ip->saddr, /* pseudo header */
+                        2 * sizeof(ip->saddr),
+                        IPPROTO_UDP + (u_int32_t)ntohs(udp->len)))));
+
+    return buf + sizeof(struct udphdr);
+}
+
+static u_char *inject_fill_tcp_data(u_char *buf, struct tcphdr *tcp_hdr, 
+                    u_char *app_data, int app_len, uint32_t ack)
+{
+    struct tcphdr *tcp = (struct tcphdr *)buf;
+    struct iphdr  *ip;
+
+    ip = (struct iphdr *)(buf - sizeof(*ip));
+
+    tcp->source = tcp_hdr->dest;
+    tcp->dest = tcp_hdr->source;
+    tcp->seq = tcp_hdr->ack_seq;
+    tcp->ack_seq = htonl(ack);
+    tcp->doff = 5;
+    tcp->fin = 1;
+    tcp->ack = 1;
+    tcp->window = htons(8192);
+    tcp->urg = 0;
+
+    tcp->check = wrapsum(checksum(
+        tcp, sizeof(*tcp),       /* tcp header */
+        checksum(app_data, /* tcp payload */
+                 app_len,
+                 checksum(&ip->saddr, /* pseudo header */
+                        2 * sizeof(ip->saddr),
+                        IPPROTO_TCP + app_len + sizeof(struct tcphdr)))));
+
+    return buf + sizeof(struct tcphdr);
+}
+
+static int inject_prepare_tcp_pkt(pkt_inject_t *injector, u_char *buf, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr,
+                    u_char *data, int len)
+{
+    u_char    *dp = buf;
+
+    int pkt_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr) + len;
     
-failed:
-    snprintf(injector->errbuf, LIBNET_ERRBUF_SIZE, "%s", libnet_geterror(injector->l));
-    return -1;
+    uint32_t ack = ntohl(tcp_hdr->seq) + ntohs(ip_hdr->tot_len) - (ip_hdr->ihl << 2) - (tcp_hdr->doff << 2);
+
+    dp = inject_fill_2lay_data(dp, &injector->src, &injector->dst);
+    dp = inject_fill_3lay_data(dp, ip_hdr, pkt_len, IPPROTO_TCP);
+    dp = inject_fill_tcp_data(dp, tcp_hdr, data, len, ack);
+
+    memcpy(dp, data, len);
+
+    return dp - buf + len;
 }
 
-int inject_src_data(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr,
-                     u_char *data, size_t datalen)
+static int inject_prepare_udp_pkt(pkt_inject_t *injector, u_char *buf, struct iphdr *ip_hdr, struct udphdr *udp_hdr, 
+                    u_char *data, int len)
 {
-    int    sended;
-    size_t pload;
+    u_char   *dp = buf;
 
-    sended = 0;
+    int  pkt_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr) + len;   
 
-    while (datalen > 0) {
-        pload = datalen > injector->mss ? injector->mss : datalen;
+    dp = inject_fill_2lay_data(dp, &injector->src, &injector->dst);
+    dp = inject_fill_3lay_data(dp, ip_hdr, pkt_len, IPPROTO_UDP);
+    dp = inject_fill_udp_data(dp, udp_hdr, data, len);
 
-        if (inject_src_one_packet(injector, ip_hdr, tcp_hdr, data + sended, pload, sended)) {
-            return -1;
-        }
+    memcpy(dp, data, len);
 
-        sended += pload;
-        datalen -= pload;        
-    }
-
-    return 0;
+    return dp - buf + len;
 }
 
-int inject_src_rst(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr)
+static int inject_packet_send(pkt_inject_t *injector, u_char *pkt, int pktlen)
 {
-    uint16_t tcp_dl;
+    int   i;
+    int   cur;
 
-#ifndef WITH_RST 
-    static const char *data = "hello";
-    size_t datalen = 5;
-#endif
+    struct netmap_if *nifp;
+    struct netmap_ring *txring = NULL;
 
-    tcp_dl = ntohs(ip_hdr->tot_len) - (ip_hdr->ihl * 4) - tcp_hdr->doff * 4;
-
-    injector->tcp_tag = libnet_build_tcp(ntohs(tcp_hdr->dest),   
-                            ntohs(tcp_hdr->source),                 
-                            ntohl(tcp_hdr->ack_seq),                 
-                            ntohl(tcp_hdr->seq) + tcp_dl,
-#ifdef WITH_RST
-                            TH_ACK|TH_RST,
-#else         
-    #ifdef WITH_FIN
-                            TH_FIN|TH_PUSH|TH_ACK, //TH_RST | TH_ACK | TH_PUSH,
-    #else
-                            TH_PUSH|TH_ACK,
-    #endif
-#endif
-                            tcp_hdr->window,                           
-                            0,                                       
-                            0,
-#ifdef WITH_RST
-                            LIBNET_TCP_H,
-                            NULL,
-                            0,
-#else                                       
-                            LIBNET_TCP_H + datalen,	                        
-                            (uint8_t *)data,                                  
-                            datalen,
-#endif                                    
-                            injector->l,                             
-                            injector->tcp_tag); 
-    if (injector->tcp_tag == -1) {
-        goto failed;
+    if (ioctl(injector->nmd->fd, NIOCTXSYNC, NULL) < 0) {
+        log_error("ioctl error on nic: %s", strerror(errno));
+        return -1;
     }
 
-	injector->ipv4_tag = libnet_build_ipv4(
-#ifdef WITH_RST
-                            LIBNET_IPV4_H + LIBNET_TCP_H,
-#else                             
-                            LIBNET_IPV4_H + LIBNET_TCP_H + datalen, 
-#endif
-		                    0,                                
-		                    ip_hdr->id,                    
-		                    0,                               
-		                    51,							      
-		                    IPPROTO_TCP,                      
-		                    0,                                
-		                    ip_hdr->daddr,            
-		                    ip_hdr->saddr,            
-		                    NULL,                             
-		                    0,                                
-		                    injector->l,                       
-		                    injector->ipv4_tag);                     
-	if (injector->ipv4_tag == -1) {
-		goto failed;
-    }
-    
-	injector->ether_tag = libnet_build_ethernet((void *)injector->dmac,  
-		                    (void *)injector->smac,                           
-		                    ETHERTYPE_IP,                             
-		                    NULL,                                    
-		                    0,                                        
-		                    injector->l,                              
-		                    injector->ether_tag);                                
-	if (injector->ether_tag == -1) {
-		goto failed;
-	}
+    nifp = injector->nmd->nifp;
 
-	if(libnet_write(injector->l) == -1) {
-        goto failed;
+    for (i = injector->nmd->first_tx_ring; i <= injector->nmd->last_tx_ring; i++) {
+        txring = NETMAP_TXRING(nifp, i);
+        if (nm_ring_empty(txring))
+            continue;
+        
+        cur = txring->cur;
+
+        struct netmap_slot *slot = &txring->slot[cur];
+
+        char *p = NETMAP_BUF(txring, slot->buf_idx);
+
+        nm_pkt_copy(pkt, p, pktlen);
+        slot->len = pktlen;
+
+        slot->flags &= ~NS_MOREFRAG;
+        slot->flags |= NS_REPORT;
+
+        cur = nm_ring_next(txring, cur);
+
+        txring->head = txring->cur = cur;
+        break;
     }
 
-    return 0;
+    if (ioctl(injector->nmd->fd, NIOCTXSYNC, NULL) < 0) {
+        log_error("ioctl error on nic: %s", strerror(errno));
+        return -1;
+    }
 
-failed:
-    snprintf(injector->errbuf, LIBNET_ERRBUF_SIZE, "%s", libnet_geterror(injector->l));
-    return -1;
+    return i <= injector->nmd->last_tx_ring ? 1 : 0;
 }
 
-int inject_dst_rst(net_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr)
+int inject_tcp_packet(pkt_inject_t *injector, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr, 
+                    u_char *data, int len)
 {
-	injector->tcp_tag = libnet_build_tcp(ntohs(tcp_hdr->source),      
-		                    ntohs(tcp_hdr->dest),                       
-		                    ntohl(tcp_hdr->seq),                            
-                            ntohl(tcp_hdr->ack_seq),                            
-                            TH_FIN, //TH_RST,
-		                    tcp_hdr->window,                   
-		                    0,                             
-		                    0,                             
-		                    LIBNET_TCP_H,                  
-		                    NULL,                          
-		                    0,                             
-		                    injector->l,                    
-		                    injector->tcp_tag);                     
-	if (injector->tcp_tag == -1) {
-		goto failed;
-    }
-    
-	injector->ipv4_tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 
-		                    0,                            
-		                    ip_hdr->id,                
-		                    0,                            
-		                    51,							  
-		                    IPPROTO_TCP,                  
-		                    0,                            
-		                    ip_hdr->saddr,        
-		                    ip_hdr->daddr,        
-		                    NULL,                         
-		                    0,                            
-		                    injector->l,                   
-		                    injector->ipv4_tag);                    
-	if (injector->ipv4_tag == -1) {
-		goto failed;
-	}    
+    int    pktlen;
+    u_char pkt[MAX_PKT_SIZE];
 
-	injector->ether_tag = libnet_build_ethernet((void*)injector->dmac,  
-		                    (void*)injector->smac,                           
-		                    ETHERTYPE_IP,                            
-		                    NULL,                                    
-		                    0,                                       
-		                    injector->l,                              
-		                    injector->ether_tag);                               
-	if (injector->ether_tag == -1) {
-		goto failed;
-	}
+    pktlen = inject_prepare_tcp_pkt(injector, pkt, ip_hdr, tcp_hdr, data, len);
 
-	if(libnet_write(injector->l) == -1) {
-		goto failed;
-	}
-    
-    return 0;
-    
-failed:
-    snprintf(injector->errbuf, LIBNET_ERRBUF_SIZE, "%s", libnet_geterror(injector->l));
-    return -1;
+    return inject_packet_send(injector, pkt, pktlen);
 }
+
+int inject_udp_packet(pkt_inject_t *injector, struct iphdr *ip_hdr, struct udphdr *udp_hdr, 
+                    u_char *data, int len)
+{
+    int    pktlen;
+    u_char pkt[MAX_PKT_SIZE];
+
+    pktlen = inject_prepare_udp_pkt(injector, pkt, ip_hdr, udp_hdr, data, len);
+
+    return inject_packet_send(injector, pkt, pktlen);
+}
+

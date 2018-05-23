@@ -1,5 +1,4 @@
 #include "rpc.h"
-#include "conf.h"
 #include "log.h"
 #include "sock.h"
 #include "http_parser.h"
@@ -27,8 +26,7 @@
 
 struct ev_loop *rpc_loop;
 
-extern int            hjk_process_num;
-extern hjk_process_t  hjk_processes[HJK_MAX_PROCESSES];
+extern hjk_process_t  hjk_process;
 
 typedef struct {
     ev_io    rw_watcher;
@@ -143,13 +141,11 @@ static void rpc_req_response(rpc_connection_t *conn)
 
 static void rpc_pipe_msg(char *buf, size_t len)
 {
-    int i, n;
+    int n;
 
-    for (i = 0; i < hjk_process_num; i++) {
-        n = write(hjk_processes[i].fd[1], buf, len);
-        if (n != len) {
-            log_error("failed send pipe msg to process %d", hjk_processes[i].pid);
-        }
+    n = write(hjk_process.fd[1], buf, len);
+    if (n != len) {
+        log_error("failed send pipe msg to process %d", hjk_process.pid);
     }
 }
 
