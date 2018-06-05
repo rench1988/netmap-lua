@@ -6,9 +6,7 @@
 
 #define MAX_PIPE_BODY  (4098 + 2)
 
-#define MAX_IFNAMELEN 64
-
-typedef struct {
+typedef struct hjk_process_s {
     pid_t  pid;
     int    fd[2];
     int    core;
@@ -17,22 +15,18 @@ typedef struct {
 } hjk_process_t;
 
 
-typedef struct {
-    int   affinity;
-    int   burst;
+typedef struct hjk_cycle_s {
+    int    affinity;
+    int    threads;
 
     char  *laddr;
     int    lport;
 
-    char  iether[MAX_IFNAMELEN];
-    char  oether[MAX_IFNAMELEN];
+    const char  *iether;
+    const char  *nmr;
 
-    char  *nmr;
-    const char  *http_302_str;
-
-    struct ether_addr src_mac;
-    struct ether_addr dst_mac;
-} hjk_conf_t;
+    hjk_process_t  proc;
+} hjk_cycle_t;
 
 #endif
 

@@ -25,34 +25,26 @@
 
 #define MAX_PIPE_BUF_SIZE  4089
 
-const char http_302_str[] = "http://www.lljjsy.com/";
-const char version[] = "2.0.0";
-const char build_time[] = __DATE__ " " __TIME__;
+static const u_char  version[]   = "1.0.0";
+static const u_char  buildTime[] = __DATE__ " " __TIME__;
 
-static u_char  program[] = "hjk";
-static u_char  master_process[] = "master process";
-static u_char  worker_process[] = "worker process";
-
-pid_t   hjk_pid;
-
-int            hjk_process_num;
-int            hik_process_slot;
-hjk_process_t  hjk_process;
+static const u_char  program[] = "hjk";
+static const u_char  master_process[] = "master process";
+static const u_char  worker_process[] = "worker process";
 
 void helper(void)
 {
-    printf("net-hijack version: %s built at %s" LINEFEED, version, build_time);
-    printf("Usage: net-hijack [-?haioD]" LINEFEED 
-            LINEFEED
-            "Options:" LINEFEED 
-            "  -?,-h            : this help" LINEFEED
-            "  -a cpu id	    : use setaffinity" LINEFEED
-            "  -i interface     : set capture interface" LINEFEED
-            "  -o interface     : set inject interface" LINEFEED
-            "  -D mac           : set inject mac address" LINEFEED
-            "  -l address       : rpc listen address" LINEFEED
-            "  -p port          : rpc listen port" LINEFEED
-            "  -P http location : http 302 redirect location" LINEFEED);
+    printf("netmap-cap version: %s built at %s\n", version, buildTime);
+    printf("Usage: netmap-cap [-?haiClpdt]\n"
+            "Options:\n" 
+            "  -?,-h            : this help\n"
+            "  -a cpu id	    : use setaffinity\n"
+            "  -i interface     : set capture interface\n"
+            "  -C netmap opt    : set netmap desc option\n"
+            "  -l address       : rpc listen address\n"
+            "  -p port          : rpc listen port\n"
+            "  -t threads       : worker threads\n"
+            "  -d debug         : debug mode\n");
 }
 
 void hjk_log_init(int debug)
@@ -61,7 +53,7 @@ void hjk_log_init(int debug)
 
     fp = fopen(HIJACK_LOG_FILE, "w");
     if (!fp) {
-        printf("failed create log file[%s], exit" LINEFEED, strerror(errno));
+        printf("failed create log file[%s], exit\n", strerror(errno));
         exit(-1);
     }
 
@@ -144,15 +136,13 @@ void *hjk_worker_listen_pipe(void *arg)
     return NULL;
 }
 
-void hjk_worker_process_cycle(hjk_conf_t *conf)
+void hjk_worker_process_cycle(hjk_cycle_t *cycle)
 {
     pthread_t  t_pipe;
 
     setproctitle((char *)program, (char *)worker_process);
 
-    hjk_pid = getpid();
-
-    log_info("worker process[%d] start to running...", hjk_pid);
+    log_info("worker process[%d] start to running...", cycle->proc.pid);
 
     close(hjk_process.fd[1]);
 
@@ -162,11 +152,11 @@ void hjk_worker_process_cycle(hjk_conf_t *conf)
     cap_service(conf);
 }
 
-pid_t hjk_spawn_process(hjk_conf_t *conf)
+pid_t hjk_spawn_process(hjk_cycle_t *cycle)
 {
     pid_t pid;
 
-    if (pipe(hjk_process.fd)) {
+    if (pipe(cycle->proc.fd)) {
         goto failed;
     }
 
@@ -176,7 +166,8 @@ pid_t hjk_spawn_process(hjk_conf_t *conf)
         case -1: 
             goto failed;
         case 0: 
-            hjk_worker_process_cycle(conf);
+            hjk_worker_process_cycle(cycle);
+            break;
         default:
             break;
     }   
@@ -188,20 +179,20 @@ failed:
     exit(-1);
 } 
 
-void hjk_master_process_cycle(hjk_conf_t *conf)
+void hjk_master_process_cycle(hjk_cycle_t *cycle)
 {
     pid_t      pid;
     pthread_t  tid;
 
     setproctitle((char *)program, (char *)master_process);
 
-    pid = hjk_spawn_process(conf);
+    pid = hjk_spawn_process(cycle);
         
-    close(hjk_process.fd[0]);
+    close(cycle->proc.fd[0]);
 
-    hjk_process.pid   = pid;
+    cycle->proc.pid = pid;
 
-    pthread_create(&tid, NULL, rpc_service, conf);
+    pthread_create(&tid, NULL, rpc_service, cycle);
     pthread_detach(tid);
 }
 
@@ -211,32 +202,19 @@ int main(int argc, const char *argv[])
     int             status;
     int             debug;
     pid_t           pid;
-    hjk_conf_t      conf;
-
-    struct ether_addr *e;
+    hjk_cycle_t     cycle;
 
     debug = 0;
 
-    bzero(&conf, sizeof(conf));
+    bzero(&cycle, sizeof(cycle));
 
-    while ((opt = getopt(argc, (char * const*)argv, "i:o:a:D:C:l:p:P:dh")) != -1) {
+    while ((opt = getopt(argc, (char * const*)argv, "i:a:C:l:p:dh")) != -1) {
         switch (opt) {
             case 'i':
-                sprintf(conf.iether, "netmap:%s", optarg);    
-                break;
-            case 'o':
-                sprintf(conf.oether, "netmap:%s", optarg);
+                cycle->iether = optarg; 
                 break;
             case 'a':
                 conf.affinity = atoi(optarg);
-                break;
-            case 'D':
-                e = ether_aton(optarg);
-                if (e == NULL) {
-                    printf("invalid MAC address '%s'\n", optarg);
-                    return 1;                    
-                }
-                bcopy(e, &conf.dst_mac, 6);
                 break;
             case 'd':
                 debug = 1;
@@ -247,14 +225,11 @@ int main(int argc, const char *argv[])
             case 'l':
                 conf.laddr = optarg;
                 break;
+            case 't':
+                conf.threads = atoi(threads);
+                break;
             case 'p':
                 conf.lport = atoi(optarg);
-                break;
-            case 'b':
-                conf.burst = atoi(optarg);
-                break;
-            case 'P':
-                conf.http_302_str = optarg;
                 break;
             case 'h':
             case '?':
@@ -265,25 +240,19 @@ int main(int argc, const char *argv[])
         }
     }
 
-    if (strlen(conf.iether) == 0 || strlen(conf.oether) == 0) {
-        printf("capture or inject interface can't be null" LINEFEED);
+    if (cycle.iether == NULL) {
+        printf("capture interface can't be null\n");
         exit(0);
     }
 
-    if (conf.laddr == NULL || conf.lport == 0) {
-        printf("rpc service information can't be null" LINEFEED);
+    if (cycle.laddr == NULL || cycle.lport == 0) {
+        printf("rpc service information can't be null\n");
         exit(0);
     }
-
-    if (conf.http_302_str == NULL) {
-        conf.http_302_str = http_302_str;
-    }
-
-    hwaddr_mac(conf.oether, &conf.src_mac);
 
     hjk_log_init(debug);
 
-    printf("program start..." LINEFEED);
+    printf("program start...\n");
 
     initproctitle(argc, (char **)argv);
 
@@ -291,7 +260,7 @@ int main(int argc, const char *argv[])
 
     setrlimit_core();
 
-    hjk_master_process_cycle(&conf);
+    hjk_master_process_cycle(&cycle);
 
     while ((pid = waitpid(-1, &status, 0)) != -1) {
         log_error("worker process[%d] shutdown[%s]", pid, WIFEXITED(status) ? "exited" : "unexpected");
