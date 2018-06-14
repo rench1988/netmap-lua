@@ -3,7 +3,7 @@
 
 #include "hijack.h"
 
-void cap_service(hjk_conf_t *conf);
+void cap_service(hjk_cycle_t *cycle);
 
 #endif
 

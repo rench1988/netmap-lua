@@ -2,7 +2,7 @@
 #define __hijack_h__
 
 
-#include <net/ethernet.h>
+#include <sys/types.h>
 
 #define MAX_PIPE_BODY  (4098 + 2)
 
@@ -17,10 +17,13 @@ typedef struct hjk_process_s {
 
 typedef struct hjk_cycle_s {
     int    affinity;
-    int    threads;
+    int    debug;
 
-    char  *laddr;
-    int    lport;
+    const char  *laddr;
+    int          lport;
+
+    const char  *raddr;
+    int          rport;
 
     const char  *iether;
     const char  *nmr;

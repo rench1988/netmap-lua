@@ -326,9 +326,9 @@ static void rpc_run(void)
 
 void *rpc_service(void *arg)
 {
-    hjk_conf_t *conf = (hjk_conf_t *)arg;
+    hjk_cycle_t *cycle = (hjk_cycle_t *)arg;
 
-    rpc_init(conf->laddr, conf->lport);
+    rpc_init(cycle->laddr, cycle->lport);
     rpc_run();
 
     return NULL;

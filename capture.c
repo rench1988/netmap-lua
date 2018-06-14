@@ -1,11 +1,8 @@
 #include "capture.h"
-#include "lkf_queue.h"
-#include "policy.h"
 #include "log.h"
 #include "http_parser.h"
 #include "util.h"
 #include "https.h"
-#include "inject.h"
 #include "dns.h"
 #include "gtpu.h"
 #include <pthread.h>
@@ -20,213 +17,225 @@
 #include <netinet/in.h> 
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <net/netmap.h>
 #define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
+#include <hiredis.h>
 
 #define CAP_HTTP_PORT    80
 #define CAP_HTTPS_PORT   443
 #define CAP_DNS_PORT     53
 #define CAP_GTP_PORT     2152
 
-#define MIN_BURST_SIZE  512
+#define CAP_REDIS_CONNECT_INTERVAL  15
 
-#define MAX_PACKET_LEN  65535
+#define CAP_MAX_HOST_LEN  512
 
-#define MAX_PACKET_STATUE  1000000
-#define MAX_HOST_LEN   256
-
-static const char http_302_str[] = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n"
-                                "Cache-Control:no-store, no-cache\r\nExpires: Sat, 18 Jul 1988 05:00:00\r\n"
-                                "Pragma: no-cache\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nLocation: ";
-
-char pushaddr[MAX_URL_LEN];
-
-extern int  hik_process_slot;
-
-extern pid_t   hjk_pid;
-
-struct cap_ctrs {
-	uint64_t pkts, bytes, events, drop, send;
+struct cap_stats {
+	uint64_t pkts, bytes, events, drop, send, procs;
+    uint64_t dns, http, https;
 	uint64_t min_space;
 	struct   timeval t;
 };
 
-typedef struct {
-    int  hflag;
-    char host[MAX_HOST_LEN];
-    char url[MAX_URL_LEN];
-} cap_url_t;
+typedef struct cap_http_request_s {
+    int    hflag;
+    int    hostLen;
+    int    urlLen;
+    char  *host;
+    char  *url;
+} cap_http_request_t;
 
 typedef struct cap_worker_s {
+    int        wid;
     pthread_t  tid;
 
     int    affinity;
-    int    burst;
     int    done;
-    struct nm_desc *inm;
-    struct nm_desc *onm;
 
-    struct cap_ctrs ctr;
+    char   *redis_addr;
+    int     redis_port;
+    time_t  redis_conn_time;
 
-    pkt_inject_t injector;
+    struct nm_desc   *nm;
+    struct cap_stats  ctr;
+
+    redisContext *c;
 } cap_worker_t;
 
 
-static int cap_on_headers_complete(http_parser *parser);
-static int cap_header_field_cb(http_parser *parser, const char *buf, size_t len);
-static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len);
-static int cap_url_cb(http_parser *parser, const char *buf, size_t len);
+static int http_headers_complete_cb(http_parser *parser);
+static int http_header_field_cb(http_parser *parser, const char *buf, size_t len);
+static int http_header_value_cb(http_parser *parser, const char *buf, size_t len);
+static int http_url_cb(http_parser *parser, const char *buf, size_t len);
 
 static int cap_process_udp(u_char *cp, size_t len,
                             struct ether_header *eth_hdr,
                             struct iphdr        *ip_hdr,
-                            pkt_inject_t        *injector);
+                            struct cap_stats    *stats,
+                            cap_worker_t        *worker);
 
 static int cap_process_tcp(u_char *cp, size_t len,
                             struct ether_header *eth_hdr,
                             struct iphdr        *ip_hdr,
-                            pkt_inject_t        *injector);
+                            struct cap_stats    *stats,
+                            cap_worker_t        *worker);
 
-static int cap_inject_app_hello(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
-                               struct tcphdr *tcp_hdr, pkt_inject_t  *injector);
-
-static int cap_inject_app_302(struct ether_header *eth_hdr, struct iphdr *ip_hdr,
-                           struct tcphdr *tcp_hdr, cap_url_t *url, pkt_inject_t *injector);
-
-static int cap_inject_dns(struct iphdr        *ip_hdr,
-                           struct udphdr       *udp_hdr,
-                           dns_message_t       *msg,
-                           struct dns_question *qs,
-                           pkt_inject_t        *injector);
+static void cap_worker_connect_redis(cap_worker_t *worker);
 
 
 static http_parser_settings parser_settings = {
-    .on_headers_complete = cap_on_headers_complete
-   ,.on_header_field     = cap_header_field_cb
-   ,.on_header_value     = cap_header_value_cb
-   ,.on_url              = cap_url_cb
+    .on_headers_complete = http_headers_complete_cb
+   ,.on_header_field     = http_header_field_cb
+   ,.on_header_value     = http_header_value_cb
+   ,.on_url              = http_url_cb
 };
 
-static int cap_on_headers_complete(http_parser *parser)
+static int http_headers_complete_cb(http_parser *parser)
 {
     return -1;
 }
 
-static int cap_header_field_cb(http_parser *parser, const char *buf, size_t len)
+static int http_header_field_cb(http_parser *parser, const char *buf, size_t len)
 {
-    cap_url_t *url = (cap_url_t *)parser->data;
+    cap_http_request_t *req = (cap_http_request_t *)parser->data;
 
     if (len == 4 && strncasecmp(buf, "host", 4) == 0) {
-        url->hflag = 1;
+        req->hflag = 1;
     } else {
-        url->hflag = 0;
+        req->hflag = 0;
     }
 
     return 0;
 }
 
-static int cap_header_value_cb(http_parser *parser, const char *buf, size_t len)
+static int http_header_value_cb(http_parser *parser, const char *buf, size_t len)
 {
-    cap_url_t *url = (cap_url_t *)parser->data;
+    cap_http_request_t *req = (cap_http_request_t *)parser->data;
 
-    if (url->hflag == 0) {
+    if (req->hflag == 0) {
         return 0;
     }
 
-    if (len >= MAX_HOST_LEN) {
-        return 1;
-    }
+    req->host = (char *)malloc(len + 1);
+    memcpy(req->host, buf, len);
 
-    memcpy(url->host, buf, len);
+    req->host[len] = 0;
+    req->hostLen = len;
 
     return -1;
 }
 
-static int cap_url_cb(http_parser *parser, const char *buf, size_t len)
+static int http_url_cb(http_parser *parser, const char *buf, size_t len)
 {
-    cap_url_t *url = (cap_url_t *)parser->data;
+    cap_http_request_t *req = (cap_http_request_t *)parser->data;
 
-    if (len >= MAX_URL_LEN) {
-        return -1;
-    }
+    req->url = (char *)malloc(len + 1);
+    memcpy(req->url, buf, len);
 
-    memcpy(url->url, buf, len);
+    req->url[len] = 0;
+    req->urlLen = len;
 
     return 0;
+}
+
+static void cap_process_domain(const char *host, cap_worker_t *worker)
+{
+    redisReply *reply;
+
+    if (worker->c == NULL || worker->c->err || host == NULL) {
+        return;
+    }
+
+    reply = redisCommand(worker->c, "EXISTS %s", host);
+    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
+        goto leave;
+    }
+
+    freeReplyObject(reply);
+
+    reply = redisCommand(worker->c, "HSET %s crawed 0", host);
+
+leave:
+    if (reply != NULL) {
+        freeReplyObject(reply);
+    }
+
+    if (worker->c == NULL || worker->c->err) {
+        log_error("worker %d redis connection is down", worker->wid);
+    }
+
+    return;
 }
 
 static int cap_process_http_inject(u_char *http_data, size_t n,
                                         struct ether_header *eth_hdr,
                                         struct iphdr        *ip_hdr,
                                         struct tcphdr       *tcp_hdr,
-                                        pkt_inject_t        *injector)
+                                        struct cap_stats    *stats,
+                                        cap_worker_t        *worker)
 {
-    int         parserd;
-    http_parser parser;
-    char       *pos;
-    char        tmp[MAX_URL_LEN];
-    cap_url_t   url;
+    int          parserd;
+    http_parser  parser;
+    //char        *pos;
 
+    cap_http_request_t   req;
+/*
     if (http_data[0] != 'G' && http_data[0] != 'P') {
         return 0;
     }
-
-    memset(&url, 0x00, sizeof(cap_url_t));
+*/
+    bzero(&req, sizeof(cap_http_request_t));
 
     http_parser_init(&parser, HTTP_REQUEST);
-    parser.data = &url;
+    parser.data = &req;
     parserd = http_parser_execute(&parser, &parser_settings, (char *)http_data, n);
     if (parserd != n && HTTP_PARSER_ERRNO(&parser) != HPE_CB_header_value) {
-        return 0;
+        goto ret;
     }
 
-    pos = strchr(url.url, '?');
-    if (pos != NULL) {
-        *pos = 0;
+    stats->procs++;
+    cap_process_domain(req.host, worker);
+
+ret:
+    if (req.host != NULL) {
+        free(req.host);
     }
 
-    memset(tmp, 0x00, sizeof(tmp));
-    snprintf(tmp, MAX_URL_LEN, "%s%s", url.host, url.url);
-
-    log_debug("http cap: %s", tmp);
-
-    if (!policy_url_meet(tmp)) {
-        return 0; 
+    if (req.url != NULL) {
+        free(req.url);
     }
 
-    return cap_inject_app_302(eth_hdr, ip_hdr, tcp_hdr, &url, injector);
+    return 0;
 }
 
 static int cap_process_https_inject(u_char *https_data, size_t n,
                                         struct ether_header *eth_hdr,
                                         struct iphdr        *ip_hdr,
                                         struct tcphdr       *tcp_hdr,
-                                        pkt_inject_t        *injector)
+                                        struct cap_stats    *stats,
+                                        cap_worker_t        *worker)
 {
     int   ret;
-    char  host[MAX_HOST_LEN];
+    char  host[CAP_MAX_HOST_LEN];
 
-    ret = parse_tls_header((const char *)https_data, n, host, MAX_HOST_LEN);
+    ret = parse_tls_header((const char *)https_data, n, host, CAP_MAX_HOST_LEN);
     if (ret <= 0) {
         return 0;
     }
 
-    if (host[ret - 1] != URL_SPLIT && ret < MAX_HOST_LEN - 1) {
-        host[ret] = URL_SPLIT;
-        host[ret + 1] = 0;
-    }
+    stats->procs++;
 
-    log_debug("https cap: %s", host);
+    cap_process_domain(host, worker);
 
-    if (!policy_url_meet(host)) {
-        return 0;
-    }
-
-    return cap_inject_app_hello(eth_hdr, ip_hdr, tcp_hdr, injector);
+    return 0;
 }
 
-static int cap_process_gtp_inject(u_char *data, size_t len, struct ether_header *eth_hdr, pkt_inject_t *injector)
+static int cap_process_gtp_cap(u_char *data, size_t len, 
+                                    struct ether_header *eth_hdr, 
+                                    struct cap_stats    *stats,
+                                    cap_worker_t        *worker)
 {
     int             parsered;
     struct iphdr   *ip_hdr;
@@ -255,9 +264,9 @@ static int cap_process_gtp_inject(u_char *data, size_t len, struct ether_header 
 
     switch (ip_hdr->protocol) {
         case IPPROTO_TCP:
-            return cap_process_tcp(data, len, eth_hdr, ip_hdr, injector);
+            return cap_process_tcp(data, len, eth_hdr, ip_hdr, stats, worker);
         case IPPROTO_UDP:
-            return cap_process_udp(data, len, eth_hdr, ip_hdr, injector);
+            return cap_process_udp(data, len, eth_hdr, ip_hdr, stats, worker);
         default:
             return 0;
     }
@@ -265,11 +274,12 @@ static int cap_process_gtp_inject(u_char *data, size_t len, struct ether_header 
     return 0;
 }
 
-static int cap_process_dns_inject(u_char *data, size_t len,
+static int cap_process_dns_cap(u_char *data, size_t len,
                                    struct ether_header *eth_hdr,
                                    struct iphdr        *ip_hdr,
                                    struct udphdr       *udp_hdr,
-                                   pkt_inject_t        *injector)
+                                   struct cap_stats    *stats,
+                                   cap_worker_t        *worker)
 {
     dns_message_t        msg;
     struct dns_question *qs;
@@ -280,10 +290,12 @@ static int cap_process_dns_inject(u_char *data, size_t len,
         return 0;
     }
 
+    stats->procs++;
+
     qs = msg.questions;
     while (qs != NULL) {
-        if (policy_url_meet(qs->name) && qs->type == dns_rr_a) {
-            cap_inject_dns(ip_hdr, udp_hdr, &msg, qs, injector);
+        if (qs->type == dns_rr_a) {
+            cap_process_domain(qs->name, worker);
             break;
         }
         qs = qs->next;
@@ -294,55 +306,11 @@ static int cap_process_dns_inject(u_char *data, size_t len,
     return qs != NULL;
 }
 
-static int cap_inject_dns(struct iphdr        *ip_hdr,
-                           struct udphdr       *udp_hdr,
-                           dns_message_t       *msg,
-                           struct dns_question *qs,
-                           pkt_inject_t        *injector)
-{
-    int  l;
-    u_char sendData[1500];
-
-    l = dns_gen_response(msg, qs, (char *)sendData, sizeof(sendData));
-    if (l == -1) {
-        return 0;
-    }
-
-    return inject_udp_packet(injector, ip_hdr, udp_hdr, sendData, l);
-}
-
-static int cap_inject_app_hello(struct ether_header *eth_hdr,
-                                  struct iphdr        *ip_hdr,
-                                  struct tcphdr       *tcp_hdr,
-                                  pkt_inject_t        *injector)
-{
-    int    app_len;
-    char   app_packet[32];
-
-    app_len = snprintf(app_packet, 32, "hello");
-
-    return inject_tcp_packet(injector, ip_hdr, tcp_hdr, (u_char *)app_packet, app_len);
-}
-
-static int cap_inject_app_302(struct ether_header *eth_hdr,
-                              struct iphdr        *ip_hdr,
-                              struct tcphdr       *tcp_hdr,
-                              cap_url_t           *url,
-                              pkt_inject_t        *injector)
-{
-    int   app_len;
-    char  app_packet[2 * MAX_URL_LEN];
-
-    app_len = snprintf(app_packet, 2 * MAX_URL_LEN, "%s%s?domain=%s&uri=%s\r\n\r\n", http_302_str, pushaddr, 
-                                    url->host, url->url);
-
-    return inject_tcp_packet(injector, ip_hdr, tcp_hdr, (u_char *)app_packet, app_len);
-}
-
 static int cap_process_tcp(u_char *cp, size_t len,
                            struct ether_header *eth_hdr,
                            struct iphdr        *ip_hdr,
-                           pkt_inject_t        *injector)
+                           struct cap_stats    *stats,
+                           cap_worker_t        *worker)
 {
     uint8_t              tcp_hl;
     struct tcphdr       *tcp_hdr;
@@ -358,16 +326,14 @@ static int cap_process_tcp(u_char *cp, size_t len,
     if (len <= 0) {
         return 0;
     }
-/*
-    if (!policy_ip_meet(ip_hdr->saddr)) {
-        return;
-    }
-*/
+
     switch (ntohs(tcp_hdr->dest)) {
         case CAP_HTTP_PORT:
-            return cap_process_http_inject(cp, len, eth_hdr, ip_hdr, tcp_hdr, injector);
+            stats->http++;
+            return cap_process_http_inject(cp, len, eth_hdr, ip_hdr, tcp_hdr, stats, worker);
         case CAP_HTTPS_PORT:
-            return cap_process_https_inject(cp, len, eth_hdr, ip_hdr, tcp_hdr, injector);
+            stats->https++;
+            return cap_process_https_inject(cp, len, eth_hdr, ip_hdr, tcp_hdr, stats, worker);
         default:
             break;
     }
@@ -378,7 +344,8 @@ static int cap_process_tcp(u_char *cp, size_t len,
 static int cap_process_udp(u_char *cp, size_t len,
                             struct ether_header *eth_hdr,
                             struct iphdr        *ip_hdr,
-                            pkt_inject_t        *injector)
+                            struct cap_stats    *stats,
+                            cap_worker_t        *worker)
 {
     static int udp_header_size = 8;
 
@@ -399,9 +366,10 @@ static int cap_process_udp(u_char *cp, size_t len,
 
     switch (ntohs(udp_hdr->dest)) {
     case CAP_DNS_PORT:
-        return cap_process_dns_inject(cp, len, eth_hdr, ip_hdr, udp_hdr, injector);
+        stats->dns++;
+        return cap_process_dns_cap(cp, len, eth_hdr, ip_hdr, udp_hdr, stats, worker);
     case CAP_GTP_PORT:
-        return cap_process_gtp_inject(cp, len, eth_hdr, injector);
+        return cap_process_gtp_cap(cp, len, eth_hdr, stats, worker);
     default:
         return 0;
     }
@@ -444,6 +412,7 @@ static uint64_t cap_wait_for_next_report(struct timeval *prev, struct timeval *c
 	return delta.tv_sec * 1000000 + delta.tv_usec;
 }
 
+#if 0
 static int parse_nmr_config(const char *conf, struct nmreq *nmr) {
     char *w, *tok;
     int i, v;
@@ -481,8 +450,9 @@ static int parse_nmr_config(const char *conf, struct nmreq *nmr) {
                ? NM_OPEN_RING_CFG
                : 0;
 }
+#endif
 
-static int cap_process_packets_helper(u_char *data, int len, pkt_inject_t *injector)
+static int cap_process_packets_helper(u_char *data, int len, struct cap_stats *stats, cap_worker_t *worker)
 {
     u_char              *cp;
     uint16_t             eth_t;
@@ -494,7 +464,6 @@ static int cap_process_packets_helper(u_char *data, int len, pkt_inject_t *injec
     eth_hdr = (struct ether_header *)cp;
     eth_t = ntohs(eth_hdr->ether_type);
 
-	// We only care about IP packets containing at least a full IP+TCP header.
 	if(eth_t != 0x0800 && eth_t != 0x8100) {
         return 0;
     }
@@ -525,9 +494,9 @@ static int cap_process_packets_helper(u_char *data, int len, pkt_inject_t *injec
 
     switch (ip_hdr->protocol) {
         case IPPROTO_TCP:
-            return cap_process_tcp(cp, len, eth_hdr, ip_hdr, injector);
+            return cap_process_tcp(cp, len, eth_hdr, ip_hdr, stats, worker);
         case IPPROTO_UDP:
-            return cap_process_udp(cp, len, eth_hdr, ip_hdr, injector);
+            return cap_process_udp(cp, len, eth_hdr, ip_hdr, stats, worker);
         default:
             return 0;
     }
@@ -535,36 +504,66 @@ static int cap_process_packets_helper(u_char *data, int len, pkt_inject_t *injec
     return 0;
 }
 
-static int cap_process_packets(struct netmap_ring *ring, int limit, 
-                    pkt_inject_t *injector, uint64_t *bytes, uint64_t *send)
+static int cap_process_packets(struct netmap_ring *ring, struct cap_stats *stats, cap_worker_t *worker)
 {
     int      cur, rx, n, s;
-    uint64_t b = 0;
-
-    if (bytes == NULL)
-        bytes = &b;
 
     cur = ring->cur;
     n = nm_ring_space(ring);
-    if (n < limit)
-        limit = n;
-    for (rx = 0; rx < limit; rx++) {
+    
+    for (rx = 0; rx < n; rx++) {
         struct netmap_slot *slot = &ring->slot[cur];
         char *p = NETMAP_BUF(ring, slot->buf_idx);
 
-        *bytes += slot->len;
+        stats->bytes += slot->len;
 
         //dump_payload(p, slot->len, ring, cur);
-        s = cap_process_packets_helper((u_char *)p, slot->len, injector);
+        s = cap_process_packets_helper((u_char *)p, slot->len, stats, worker);
         if (s > 0) {
-            *send += s;
+            stats->send += s;
         }
 
         cur = nm_ring_next(ring, cur);
     }
     ring->head = ring->cur = cur;
 
+    stats->pkts += rx;
+    
     return (rx);
+}
+
+static void cap_worker_connect_redis(cap_worker_t *worker)
+{
+    time_t  now = time(NULL);
+
+    if (now - worker->redis_conn_time < CAP_REDIS_CONNECT_INTERVAL) {
+        return;
+    }
+
+    worker->redis_conn_time = now;
+
+    if (worker->c) {
+        redisFree(worker->c);
+        worker->c = NULL;
+    }
+
+    redisContext *c = redisConnect(worker->redis_addr, worker->redis_port);
+    if (c == NULL || c->err) {
+        if (c) {
+            log_error("worker %d failed connect redis: %s", worker->wid, c->errstr);
+            redisFree(c);
+        } else {
+            //unexpected
+        }
+
+        return;
+    }
+
+    log_info("worker %d connect redis successful", worker->wid);
+
+    worker->c = c;
+
+    return;
 }
 
 static void *cap_worker(void *arg)
@@ -577,14 +576,17 @@ static void *cap_worker(void *arg)
     struct netmap_if   *nifp;
     struct netmap_ring *rxring;
 
-    struct cap_ctrs cur;
+    struct cap_stats cur;
 
-    struct pollfd pfd = {.fd = worker->inm->fd, .events = POLLIN};
+    struct pollfd pfd = {.fd = worker->nm->fd, .events = POLLIN};
 
     cur.pkts = cur.bytes = cur.events = cur.drop = cur.min_space = cur.send = 0;
+    cur.http = cur.https = cur.dns = 0;
     cur.t.tv_usec = cur.t.tv_sec = 0; //  unused, just silence the compiler    
 
     setaffinity(worker->tid, worker->affinity);
+
+    log_info("thread %d start running, bind cpu id %d", worker->wid, worker->affinity);
 
     for (;;) {
         i = poll(&pfd, 1, 1000);
@@ -603,9 +605,13 @@ static void *cap_worker(void *arg)
            pfd.revents);
     }
 
-    nifp = worker->inm->nifp;
+    nifp = worker->nm->nifp;
 
     while (1) {
+        if (worker->c == NULL || worker->c->err) {
+            cap_worker_connect_redis(worker);
+        }
+
         ret = poll(&pfd, 1, 1 * 1000);
         
         if (ret == 0) {
@@ -619,7 +625,7 @@ static void *cap_worker(void *arg)
         }
 
         uint64_t cur_space = 0;
-        for (i = worker->inm->first_rx_ring; i < worker->inm->last_rx_ring; i++) {
+        for (i = worker->nm->first_rx_ring; i <= worker->nm->last_rx_ring; i++) {
             int m;
 
             rxring = NETMAP_RXRING(nifp, i);
@@ -631,8 +637,7 @@ static void *cap_worker(void *arg)
             if (nm_ring_empty(rxring))
                 continue;
 
-            m = cap_process_packets(rxring, worker->burst, &worker->injector, &cur.bytes, &cur.send);
-            cur.pkts += m;
+            m = cap_process_packets(rxring, &cur, worker);
             if (m > 0)
                 cur.events++;
         }
@@ -648,93 +653,126 @@ done:
     return NULL;
 }
 
-static void cap_log_status(cap_worker_t *worker)
+static void cap_log_status(cap_worker_t *workers, int nring)
 {
-    struct cap_ctrs prev, cur;
+    int    i;
+    struct cap_stats prev, cur;
 
     prev.pkts = prev.bytes = prev.events = prev.send = 0;
+    prev.http = prev.https = prev.dns = 0;
     gettimeofday(&prev.t, NULL);
 
     for (;;) {
-        char b1[40], b2[40], b3[40], b4[70], b5[40];
+        char b1[40], b2[40], b3[40], b4[70], b5[40], b6[40], b7[40];
         uint64_t pps, usec;
-        struct cap_ctrs x;
+        struct cap_stats x;
         double abs;
 
         usec = cap_wait_for_next_report(&prev.t, &cur.t);
 
         cur.pkts = cur.bytes = cur.events = cur.send = 0;
+        cur.http = cur.https = cur.dns = 0;
         cur.min_space = 0;
         if (usec < 10000) /* too short to be meaningful */
             continue;
         /* accumulate counts for all threads */
-        
-        cur.pkts += worker->ctr.pkts;
-        cur.bytes += worker->ctr.bytes;
-        cur.events += worker->ctr.events;
-        cur.send += worker->ctr.send;
-        cur.min_space += worker->ctr.min_space;
-        worker->ctr.min_space = 99999;
+
+        for (i = 0; i < nring; i++) {
+            cur.pkts += workers[i].ctr.pkts;
+            cur.bytes += workers[i].ctr.bytes;
+            cur.events += workers[i].ctr.events;
+            cur.send += workers[i].ctr.send;
+            cur.min_space += workers[i].ctr.min_space;
+            cur.http += workers[i].ctr.http;
+            cur.https += workers[i].ctr.https;
+            cur.dns += workers[i].ctr.dns;
+
+            workers[i].ctr.min_space = 99999;
+        }
 
         x.pkts = cur.pkts - prev.pkts;
         x.bytes = cur.bytes - prev.bytes;
         x.events = cur.events - prev.events;
         x.send = cur.send - prev.send;
+        x.http = cur.http - prev.http;
+        x.https = cur.https - prev.https;
+        x.dns = cur.dns - prev.dns;
+
         pps = (x.pkts * 1000000 + usec / 2) / usec;
         abs = (x.events > 0) ? (x.pkts / (double)x.events) : 0;
 
         strcpy(b4, "");
 
-        log_info("%spps %s(%spkts %sinjections %sbps in %llu usec) %.2f avg_batch %d min_space",
-          norm(b1, pps), b4, norm(b2, (double)x.pkts), norm(b5, (double)x.send),
-          norm(b3, (double)x.bytes * 8), (unsigned long long)usec, abs,
-          (int)cur.min_space);
+        log_info("%spps %s(%spkts %shttp %shttps %sdns %sbps in %llu usec) %.2f avg_batch %d min_space",
+          norm(b1, pps), b4, norm(b2, (double)x.pkts), norm(b5, (double)x.http),
+          norm(b6, (double)x.https), norm(b7, (double)x.dns), norm(b3, (double)x.bytes * 8),
+          (unsigned long long)usec, abs, (int)cur.min_space);
         prev = cur;
-
-        if (worker->done)
-            break;
     }    
 }
 
-void cap_service(hjk_conf_t *conf)
+static int cap_iether_rings(const char *ether_name)
 {
-    struct nmreq    base_nmd;
-    struct nm_desc *inmd, *onmd;
+    int result;
 
-    cap_worker_t worker;
+    struct nm_desc     *nmd;
+    struct netmap_if   *nifp;
+
+    nmd = nm_open(ether_name, NULL, 0, NULL);
+    if (nmd == NULL) {
+        log_error("failed to open %s: %s", ether_name, strerror(errno));
+        exit(1);
+    }
+
+    nifp = nmd->nifp;  
+    result = nifp->ni_rx_rings;
+
+    nm_close(nmd);
+
+    return result;    
+}
+
+void cap_service(hjk_cycle_t *cycle)
+{
+    int             i;
+    int             rings;
+
+    struct nmreq    base_nmd;
+    //struct nm_desc *inmd;
+
+    char            ether_name[64];
+
+    cap_worker_t   *workers;
 
     bzero(&base_nmd, sizeof(base_nmd));
-    parse_nmr_config(conf->nmr, &base_nmd);
+    //parse_nmr_config(conf->nmr, &base_nmd);
 
     base_nmd.nr_flags |= NR_ACCEPT_VNET_HDR;
 
-    inmd = nm_open(conf->iether, &base_nmd, 0, NULL);
-    if (inmd == NULL) {
-        log_error("failed to open %s: %s", conf->iether, strerror(errno));
-        exit(1);
+    snprintf(ether_name, sizeof(ether_name), "netmap:%s/R", cycle->iether);
+    rings = cap_iether_rings(ether_name);
+
+    log_info("found %d network adapter ring(s), spawn %d threads to running", rings, rings);
+
+    workers = (cap_worker_t *)calloc(rings, sizeof(cap_worker_t));
+
+    for (i = 0; i < rings; i++) {
+        snprintf(ether_name, sizeof(ether_name), "netmap:%s-%d/R", cycle->iether, i);
+
+        workers[i].nm = nm_open(ether_name, &base_nmd, 0, NULL);
+        if (workers[i].nm == NULL) {
+            log_error("failed to open %s: %s", ether_name, strerror(errno));
+            exit(1);
+        }
+
+        workers[i].wid = i;
+        workers[i].redis_addr = strdup(cycle->raddr);
+        workers[i].redis_port = cycle->rport;
+        workers[i].affinity = (cycle->affinity + i) % sysconf(_SC_NPROCESSORS_ONLN);;
+
+        pthread_create(&workers[i].tid, NULL, cap_worker, &workers[i]);
+        pthread_detach(workers[i].tid);
     }
 
-    onmd = nm_open(conf->oether, &base_nmd, 0, NULL);
-    if (onmd == NULL) {
-        log_error("failed to open %s: %s", conf->oether, strerror(errno));
-        exit(1);
-    }
-
-    strncpy(pushaddr, conf->http_302_str, sizeof(pushaddr) - 1);
-
-    bzero(&worker, sizeof(cap_worker_t));
-
-    worker.inm = inmd;
-    worker.onm = onmd;
-    worker.burst = conf->burst < MIN_BURST_SIZE ? MIN_BURST_SIZE : conf->burst;
-    worker.affinity = conf->affinity % sysconf(_SC_NPROCESSORS_ONLN);
-
-    worker.injector.nmd = onmd;
-    bcopy(&conf->dst_mac, &worker.injector.dst, sizeof(worker.injector.dst));
-    bcopy(&conf->src_mac, &worker.injector.src, sizeof(worker.injector.src));
-
-    pthread_create(&worker.tid, NULL, cap_worker, &worker);
-    pthread_detach(worker.tid);
-
-    cap_log_status(&worker);
+    cap_log_status(workers, rings);
 }

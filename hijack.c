@@ -17,9 +17,8 @@
 #include "log.h"
 #include "hijack.h"
 #include "util.h"
-#include "rpc.h"
 #include "capture.h"
-#include "policy.h"
+#include "conf.h"
 
 #define HIJACK_LOG_FILE  "hjk.log"
 
@@ -62,6 +61,7 @@ void hjk_log_init(int debug)
     log_set_quiet(1);
 }
 
+#if 0
 int hjk_worker_process_pipe_msg(char *buf, int n)
 {
     static const char sp = '\n';
@@ -135,21 +135,22 @@ void *hjk_worker_listen_pipe(void *arg)
 
     return NULL;
 }
+#endif
 
 void hjk_worker_process_cycle(hjk_cycle_t *cycle)
 {
-    pthread_t  t_pipe;
+   // pthread_t  t_pipe;
 
     setproctitle((char *)program, (char *)worker_process);
 
     log_info("worker process[%d] start to running...", cycle->proc.pid);
 
-    close(hjk_process.fd[1]);
+    close(cycle->proc.fd[1]);
 
-    pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_process.fd[0]);
-    pthread_detach(t_pipe);
+    //pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_process.fd[0]);
+    //pthread_detach(t_pipe);
 
-    cap_service(conf);
+    cap_service(cycle);
 }
 
 pid_t hjk_spawn_process(hjk_cycle_t *cycle)
@@ -161,6 +162,8 @@ pid_t hjk_spawn_process(hjk_cycle_t *cycle)
     }
 
     pid = fork();
+
+    cycle->proc.pid = pid;
 
     switch (pid) {
         case -1: 
@@ -181,8 +184,9 @@ failed:
 
 void hjk_master_process_cycle(hjk_cycle_t *cycle)
 {
+    int        status;
     pid_t      pid;
-    pthread_t  tid;
+    //pthread_t  tid;
 
     setproctitle((char *)program, (char *)master_process);
 
@@ -192,65 +196,41 @@ void hjk_master_process_cycle(hjk_cycle_t *cycle)
 
     cycle->proc.pid = pid;
 
-    pthread_create(&tid, NULL, rpc_service, cycle);
-    pthread_detach(tid);
+    //pthread_create(&tid, NULL, rpc_service, cycle);
+    //pthread_detach(tid);
+    waitpid(pid, &status, -1);
 }
 
 int main(int argc, const char *argv[])
 {
     int             opt;
     int             status;
-    int             debug;
     pid_t           pid;
     hjk_cycle_t     cycle;
-
-    debug = 0;
+    char           *file;
 
     bzero(&cycle, sizeof(cycle));
 
-    while ((opt = getopt(argc, (char * const*)argv, "i:a:C:l:p:dh")) != -1) {
+    while ((opt = getopt(argc, (char * const*)argv, "c:h")) != -1) {
         switch (opt) {
-            case 'i':
-                cycle->iether = optarg; 
-                break;
-            case 'a':
-                conf.affinity = atoi(optarg);
-                break;
-            case 'd':
-                debug = 1;
-                break;
-            case 'C':
-                conf.nmr = optarg;
-                break;
-            case 'l':
-                conf.laddr = optarg;
-                break;
-            case 't':
-                conf.threads = atoi(threads);
-                break;
-            case 'p':
-                conf.lport = atoi(optarg);
+            case 'c':
+                file = optarg;
                 break;
             case 'h':
             case '?':
                 helper();
                 break;
             default:
+                printf("unknown option %c\n", opt);
                 break;
         }
     }
 
-    if (cycle.iether == NULL) {
-        printf("capture interface can't be null\n");
-        exit(0);
+    if (parse_conf(file, &cycle)) {
+        return -1;
     }
 
-    if (cycle.laddr == NULL || cycle.lport == 0) {
-        printf("rpc service information can't be null\n");
-        exit(0);
-    }
-
-    hjk_log_init(debug);
+    hjk_log_init(cycle.debug);
 
     printf("program start...\n");
 

@@ -7,8 +7,8 @@
 typedef unsigned char u_char;
 
 typedef struct gtpuHdr_s {
-	uint8_t version_flags;
-	uint8_t msg_type;
+	uint8_t  version_flags;
+	uint8_t  msg_type;
 	uint16_t tot_len;
 	uint32_t teid;
 //	uint16_t seq_no;		/**< Optional fields if E, S or PN flags set */
