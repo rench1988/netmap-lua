@@ -140,6 +140,40 @@ static int http_url_cb(http_parser *parser, const char *buf, size_t len)
     return 0;
 }
 
+static int cap_domain_has_processed(const char *host, cap_worker_t *worker)
+{
+    int         ret = 0;
+    redisReply *reply;
+
+    reply = redisCommand(worker->c, "SISMEMBER domain_set %s", host);
+    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
+        ret = 1;
+        goto done;
+    }
+
+    freeReplyObject(reply);
+
+    reply = redisCommand(worker->c, "SISMEMBER green_set %s", host);
+    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
+        ret = 1;
+        goto done;
+    }    
+
+    freeReplyObject(reply);
+
+    reply = redisCommand(worker->c, "SISMEMBER hdd_set %s", host);
+    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
+        ret = 1;
+    }
+
+done:
+    if (reply != NULL) {
+        freeReplyObject(reply);
+    }    
+
+    return ret;
+}
+
 static void cap_process_domain(const char *host, cap_worker_t *worker)
 {
     redisReply *reply;
@@ -148,16 +182,12 @@ static void cap_process_domain(const char *host, cap_worker_t *worker)
         return;
     }
 
-    reply = redisCommand(worker->c, "EXISTS %s", host);
-    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
-        goto leave;
+    if (cap_domain_has_processed(host, worker)) {
+        return;
     }
 
-    freeReplyObject(reply);
+    reply = redisCommand(worker->c, "SADD domain_set %s", host);
 
-    reply = redisCommand(worker->c, "HSET %s crawed 0", host);
-
-leave:
     if (reply != NULL) {
         freeReplyObject(reply);
     }
