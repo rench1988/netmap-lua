@@ -25,6 +25,8 @@ typedef struct hjk_cycle_s {
     const char  *raddr;
     int          rport;
 
+    const char  *script;
+
     const char  *iether;
     const char  *nmr;
 

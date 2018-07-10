@@ -20,7 +20,7 @@
 #include "capture.h"
 #include "conf.h"
 
-#define HIJACK_LOG_FILE  "hjk.log"
+#define HJK_LOG_FILE  "hjk.log"
 
 #define MAX_PIPE_BUF_SIZE  4089
 
@@ -33,24 +33,18 @@ static const u_char  worker_process[] = "worker process";
 
 void helper(void)
 {
-    printf("netmap-cap version: %s built at %s\n", version, buildTime);
-    printf("Usage: netmap-cap [-?haiClpdt]\n"
+    printf("netmap-lua version: %s built at %s\n", version, buildTime);
+    printf("Usage: netmap-lua [-?ch]\n"
             "Options:\n" 
             "  -?,-h            : this help\n"
-            "  -a cpu id	    : use setaffinity\n"
-            "  -i interface     : set capture interface\n"
-            "  -C netmap opt    : set netmap desc option\n"
-            "  -l address       : rpc listen address\n"
-            "  -p port          : rpc listen port\n"
-            "  -t threads       : worker threads\n"
-            "  -d debug         : debug mode\n");
+            "  -c filename      : configuration file\n");
 }
 
 void hjk_log_init(int debug)
 {
     FILE *fp;
 
-    fp = fopen(HIJACK_LOG_FILE, "w");
+    fp = fopen(HJK_LOG_FILE, "w");
     if (!fp) {
         printf("failed create log file[%s], exit\n", strerror(errno));
         exit(-1);
@@ -139,16 +133,11 @@ void *hjk_worker_listen_pipe(void *arg)
 
 void hjk_worker_process_cycle(hjk_cycle_t *cycle)
 {
-   // pthread_t  t_pipe;
-
     setproctitle((char *)program, (char *)worker_process);
 
     log_info("worker process[%d] start to running...", cycle->proc.pid);
 
     close(cycle->proc.fd[1]);
-
-    //pthread_create(&t_pipe, NULL, hjk_worker_listen_pipe, (void *)(uintptr_t)hjk_process.fd[0]);
-    //pthread_detach(t_pipe);
 
     cap_service(cycle);
 }
@@ -184,9 +173,8 @@ failed:
 
 void hjk_master_process_cycle(hjk_cycle_t *cycle)
 {
-    int        status;
+    //int        status;
     pid_t      pid;
-    //pthread_t  tid;
 
     setproctitle((char *)program, (char *)master_process);
 
@@ -196,9 +184,7 @@ void hjk_master_process_cycle(hjk_cycle_t *cycle)
 
     cycle->proc.pid = pid;
 
-    //pthread_create(&tid, NULL, rpc_service, cycle);
-    //pthread_detach(tid);
-    waitpid(pid, &status, -1);
+    //waitpid(pid, &status, -1);
 }
 
 int main(int argc, const char *argv[])
@@ -232,9 +218,9 @@ int main(int argc, const char *argv[])
 
     hjk_log_init(cycle.debug);
 
-    printf("program start...\n");
-
     initproctitle(argc, (char **)argv);
+
+    printf("program daemonize...\n");
 
     daemonize();
 

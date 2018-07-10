@@ -5,6 +5,9 @@
 #include "https.h"
 #include "dns.h"
 #include "gtpu.h"
+#include <luajit-2.0/lua.h>
+#include <luajit-2.0/lualib.h>
+#include <luajit-2.0/lauxlib.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -54,14 +57,10 @@ typedef struct cap_worker_s {
     int    affinity;
     int    done;
 
-    char   *redis_addr;
-    int     redis_port;
-    time_t  redis_conn_time;
+    lua_State *L;
 
     struct nm_desc   *nm;
     struct cap_stats  ctr;
-
-    redisContext *c;
 } cap_worker_t;
 
 
@@ -82,7 +81,125 @@ static int cap_process_tcp(u_char *cp, size_t len,
                             struct cap_stats    *stats,
                             cap_worker_t        *worker);
 
-static void cap_worker_connect_redis(cap_worker_t *worker);
+//static void cap_worker_connect_redis(cap_worker_t *worker);
+
+#define PKT_SRC_ADDR_FIELD      "src_addr"
+#define PKT_DST_ADDR_FIELD      "dst_addr"
+#define PKT_SRC_PORT_FIELD      "src_port"
+#define PKT_DST_PORT_FIELD      "dst_port"
+#define PKT_DOMAIN_FIELD        "domain"
+#define PKT_URI_FIELD           "uri"
+
+
+static int cap_lua_log(lua_State *L);
+static int cap_lua_inject(lua_State *L);
+
+typedef struct cap_lua_log_s {
+    char    *src_addr;
+    char    *dst_addr;
+    char    *domain;
+    char    *uri;
+    int      src_port;
+    int      dst_port;
+} cap_lua_log_t;
+
+static const struct luaL_reg hjk_lib[] = {
+    {"log", cap_lua_log},
+    {"inject", cap_lua_inject},
+    {NULL, NULL}  /* sentinel */
+};
+
+static int cap_lua_log_info_get(lua_State *L, cap_lua_log_t *cap_log)
+{
+    lua_getfield(L, -1, PKT_SRC_ADDR_FIELD);
+    if (lua_isstring(L, -1)) {
+        cap_log->src_addr = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);    
+
+    lua_getfield(L, -1, PKT_DST_ADDR_FIELD);
+    if (lua_isstring(L, -1)) {
+        cap_log->dst_addr = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, -1, PKT_DOMAIN_FIELD);
+    if (lua_isstring(L, -1)) {
+        cap_log->domain = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, -1, PKT_URI_FIELD);
+    if (lua_isstring(L, -1)) {
+        cap_log->uri = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, -1, PKT_SRC_PORT_FIELD);
+    if (lua_isnumber(L, -1)) {
+        cap_log->src_port = lua_tonumber(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, -1, PKT_DST_PORT_FIELD);
+    if (lua_isnumber(L, -1)) {
+        cap_log->dst_port = lua_tonumber(L, -1);
+    }
+    lua_pop(L, 1);    
+
+    return 0;
+}
+
+static int cap_lua_log_info_free(cap_lua_log_t *cap_log)
+{
+    if (cap_log->src_addr) {
+        free(cap_log->src_addr);
+    }
+
+    if (cap_log->dst_addr) {
+        free(cap_log->dst_addr);
+    }
+
+    if (cap_log->domain) {
+        free(cap_log->domain);
+    }
+
+    if (cap_log->uri) {
+        free(cap_log->uri);
+    }
+
+    return 0;
+}
+
+static int cap_lua_log(lua_State *L)
+{
+    cap_lua_log_t cap_log;
+
+    bzero(&cap_log, sizeof(cap_lua_log_t));
+
+    if (lua_gettop(L) != 1) {
+        return luaL_error(L, "expecting exactly 1 arguments");
+    }
+
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "expecting lua table as arguments");
+    }
+
+    cap_lua_log_info_get(L, &cap_log);
+
+    log_info("pkt: {src_addr: %s, dst_addr: %s, src_port: %d, dst_port %d, domain: %s, uri: %s}",
+                cap_log.src_addr, cap_log.dst_addr, cap_log.src_port, 
+                cap_log.dst_port, cap_log.domain,   cap_log.uri);
+
+    cap_lua_log_info_free(&cap_log);
+
+    return 0;
+}
+
+static int cap_lua_inject(lua_State *L)
+{
+    return 0;
+}
 
 
 static http_parser_settings parser_settings = {
@@ -140,6 +257,7 @@ static int http_url_cb(http_parser *parser, const char *buf, size_t len)
     return 0;
 }
 
+#if 0
 static int cap_domain_has_processed(const char *host, cap_worker_t *worker)
 {
     int         ret = 0;
@@ -173,7 +291,9 @@ done:
 
     return ret;
 }
+#endif
 
+#if 0
 static void cap_process_domain(const char *host, cap_worker_t *worker)
 {
     redisReply *reply;
@@ -198,6 +318,66 @@ static void cap_process_domain(const char *host, cap_worker_t *worker)
 
     return;
 }
+#endif
+
+static void l_pushtablestring(lua_State* L , char* key , char* value) 
+{
+    lua_pushstring(L, key);
+    lua_pushstring(L, value);
+    lua_settable(L, -3);
+}
+
+static void l_pushtablenumber(lua_State *L, char *key, int number)
+{
+    lua_pushstring(L, key);
+    lua_pushnumber(L, number);
+    lua_settable(L, -3);
+}
+
+static int cap_process_lua_script(lua_State *L, 
+                                    struct ether_header *eth_hdr,
+                                    struct iphdr        *ip_hdr, 
+                                    struct tcphdr       *tcp_hdr,
+                                    struct udphdr       *udp_hdr,
+                                    const char          *domain,
+                                    const char          *uri)
+{
+    struct in_addr  in;
+
+    lua_settop(L, 0);
+
+    lua_getglobal(L, "capture");
+
+    lua_newtable(L);
+
+    in.s_addr = ip_hdr->saddr;
+    l_pushtablestring(L, PKT_SRC_ADDR_FIELD, inet_ntoa(in));
+
+    in.s_addr = ip_hdr->daddr;
+    l_pushtablestring(L, PKT_DST_ADDR_FIELD, inet_ntoa(in));
+
+    if (tcp_hdr != NULL) {
+        l_pushtablenumber(L, PKT_SRC_PORT_FIELD, ntohs(tcp_hdr->source));
+        l_pushtablenumber(L, PKT_DST_PORT_FIELD, ntohs(tcp_hdr->dest));
+    } else {
+        l_pushtablenumber(L, PKT_SRC_PORT_FIELD, ntohs(udp_hdr->source));
+        l_pushtablenumber(L, PKT_DST_PORT_FIELD, ntohs(udp_hdr->dest));
+    }
+
+    if (domain != NULL) {
+        l_pushtablestring(L, PKT_DOMAIN_FIELD, (char *)domain);
+    }
+
+    if (uri != NULL) {
+        l_pushtablestring(L, PKT_URI_FIELD, (char *)uri);
+    }
+
+    if (lua_pcall(L, 1, 0, 0)) {
+        log_error("failed execute lua capture function: %s", lua_tostring(L, -1));
+    }
+
+    return 0;
+}
 
 static int cap_process_http_inject(u_char *http_data, size_t n,
                                         struct ether_header *eth_hdr,
@@ -208,14 +388,13 @@ static int cap_process_http_inject(u_char *http_data, size_t n,
 {
     int          parserd;
     http_parser  parser;
-    //char        *pos;
 
     cap_http_request_t   req;
-/*
+
     if (http_data[0] != 'G' && http_data[0] != 'P') {
         return 0;
     }
-*/
+
     bzero(&req, sizeof(cap_http_request_t));
 
     http_parser_init(&parser, HTTP_REQUEST);
@@ -226,7 +405,9 @@ static int cap_process_http_inject(u_char *http_data, size_t n,
     }
 
     stats->procs++;
-    cap_process_domain(req.host, worker);
+    //cap_process_domain(req.host, worker);
+
+    cap_process_lua_script(worker->L, eth_hdr, ip_hdr, tcp_hdr, NULL, req.host, req.url);
 
 ret:
     if (req.host != NULL) {
@@ -257,7 +438,9 @@ static int cap_process_https_inject(u_char *https_data, size_t n,
 
     stats->procs++;
 
-    cap_process_domain(host, worker);
+    //cap_process_domain(host, worker);
+
+    cap_process_lua_script(worker->L, eth_hdr, ip_hdr, tcp_hdr, NULL, host, NULL);
 
     return 0;
 }
@@ -325,7 +508,8 @@ static int cap_process_dns_cap(u_char *data, size_t len,
     qs = msg.questions;
     while (qs != NULL) {
         if (qs->type == dns_rr_a) {
-            cap_process_domain(qs->name, worker);
+            //cap_process_domain(qs->name, worker);
+            cap_process_lua_script(worker->L, eth_hdr, ip_hdr, NULL, udp_hdr, qs->name, NULL);
             break;
         }
         qs = qs->next;
@@ -562,6 +746,7 @@ static int cap_process_packets(struct netmap_ring *ring, struct cap_stats *stats
     return (rx);
 }
 
+#if 0
 static void cap_worker_connect_redis(cap_worker_t *worker)
 {
     time_t  now = time(NULL);
@@ -595,6 +780,7 @@ static void cap_worker_connect_redis(cap_worker_t *worker)
 
     return;
 }
+#endif
 
 static void *cap_worker(void *arg)
 {
@@ -638,9 +824,11 @@ static void *cap_worker(void *arg)
     nifp = worker->nm->nifp;
 
     while (1) {
+        #if 0
         if (worker->c == NULL || worker->c->err) {
             cap_worker_connect_redis(worker);
         }
+        #endif
 
         ret = poll(&pfd, 1, 1 * 1000);
         
@@ -762,20 +950,33 @@ static int cap_iether_rings(const char *ether_name)
     return result;    
 }
 
+static lua_State *cap_script_create(const char *script)
+{
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    luaL_openlib(L, "hjk", hjk_lib, 0);
+
+    if (!script || luaL_dofile(L, script)) {
+        log_error("failed create lua environment: %s", lua_tostring(L, -1));
+        lua_close(L);
+        return NULL;
+    }
+
+    return L;
+}
+
 void cap_service(hjk_cycle_t *cycle)
 {
     int             i;
     int             rings;
 
     struct nmreq    base_nmd;
-    //struct nm_desc *inmd;
 
     char            ether_name[64];
 
     cap_worker_t   *workers;
 
     bzero(&base_nmd, sizeof(base_nmd));
-    //parse_nmr_config(conf->nmr, &base_nmd);
 
     base_nmd.nr_flags |= NR_ACCEPT_VNET_HDR;
 
@@ -795,9 +996,11 @@ void cap_service(hjk_cycle_t *cycle)
             exit(1);
         }
 
+        workers[i].L = cap_script_create(cycle->script);
+
         workers[i].wid = i;
-        workers[i].redis_addr = strdup(cycle->raddr);
-        workers[i].redis_port = cycle->rport;
+        //workers[i].redis_addr = strdup(cycle->raddr);
+        //workers[i].redis_port = cycle->rport;
         workers[i].affinity = (cycle->affinity + i) % sysconf(_SC_NPROCESSORS_ONLN);;
 
         pthread_create(&workers[i].tid, NULL, cap_worker, &workers[i]);

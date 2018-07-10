@@ -58,10 +58,14 @@ int parse_conf(const char *filename, hjk_cycle_t *cycle) {
     config_lookup_int(&config, "affinity", &cycle->affinity);
 
     config_compel_string("cap.ether", &cycle->iether);
+
     config_compel_string("rpc.address", &cycle->laddr);
     config_compel_int("rpc.port", &cycle->lport);
+
     config_compel_string("redis.address", &cycle->raddr);
     config_compel_int("redis.port", &cycle->rport);
+
+    config_compel_string("script", &cycle->script);
 
     return 0;
 }
