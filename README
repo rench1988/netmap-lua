@@ -1,1 +1,2 @@
-netmap capture packet and lua process packet 
+netmap as a packet capture frame  
+lua as a packet processer(record packet or inject packet)
