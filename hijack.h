@@ -22,12 +22,13 @@ typedef struct hjk_cycle_s {
     const char  *laddr;
     int          lport;
 
-    const char  *raddr;
-    int          rport;
+    //const char  *raddr;
+    //int          rport;
 
     const char  *script;
 
     const char  *iether;
+    const char  *oether;
     const char  *nmr;
 
     hjk_process_t  proc;

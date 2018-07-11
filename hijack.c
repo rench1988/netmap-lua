@@ -1,8 +1,9 @@
 /**
  * @author [rench]
- * @create date 2017-11-21 09:53:44
- * @modify date 2017-11-21 09:53:44
- * @desc [net-hiject]
+ * @email [finyren@163.com]
+ * @create date 2018-07-10 11:44:41
+ * @modify date 2018-07-10 11:44:41
+ * @desc [netmap-lua]
 */
 
 #include <string.h>
@@ -31,13 +32,22 @@ static const u_char  program[] = "hjk";
 static const u_char  master_process[] = "master process";
 static const u_char  worker_process[] = "worker process";
 
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void helper(void)
 {
     printf("netmap-lua version: %s built at %s\n", version, buildTime);
-    printf("Usage: netmap-lua [-?ch]\n"
+    printf("usage: hjk [-?ch]\n"
             "Options:\n" 
             "  -?,-h            : this help\n"
             "  -c filename      : configuration file\n");
+}
+
+void hjk_log_lock(void *udata, int lock)
+{
+    pthread_mutex_t *mutex = (pthread_mutex_t *)udata;
+
+    lock ? pthread_mutex_lock(mutex) : pthread_mutex_unlock(mutex); 
 }
 
 void hjk_log_init(int debug)
@@ -50,6 +60,8 @@ void hjk_log_init(int debug)
         exit(-1);
     }
 
+    log_set_udata(&log_mutex);
+    log_set_lock(hjk_log_lock);
     log_set_fp(fp);
     log_set_level(debug ? LOG_DEBUG : LOG_INFO);
     log_set_quiet(1);
@@ -135,7 +147,7 @@ void hjk_worker_process_cycle(hjk_cycle_t *cycle)
 {
     setproctitle((char *)program, (char *)worker_process);
 
-    log_info("worker process[%d] start to running...", cycle->proc.pid);
+    log_info("worker process[%d] start to running...", getpid());
 
     close(cycle->proc.fd[1]);
 
@@ -192,8 +204,8 @@ int main(int argc, const char *argv[])
     int             opt;
     int             status;
     pid_t           pid;
-    hjk_cycle_t     cycle;
     char           *file;
+    hjk_cycle_t     cycle;
 
     bzero(&cycle, sizeof(cycle));
 
@@ -232,7 +244,7 @@ int main(int argc, const char *argv[])
         log_error("worker process[%d] shutdown[%s]", pid, WIFEXITED(status) ? "exited" : "unexpected");
     }
 
-    log_error("program unexpected exit");
+    //log_error("program unexpected exit");
 
     return 0;
 }
