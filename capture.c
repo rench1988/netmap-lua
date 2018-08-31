@@ -6,6 +6,7 @@
 #include "dns.h"
 #include "gtpu.h"
 #include "ethertype.h"
+#include "pg_inet.h"
 #include "inject.h"
 #include <luajit-2.0/lua.h>
 #include <luajit-2.0/lualib.h>
@@ -22,12 +23,12 @@
 #include <netinet/ether.h>
 #include <netinet/in.h> 
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <net/netmap.h>
 #define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
-#include <hiredis.h>
 
 #define CAP_HTTP_PORT    80
 #define CAP_HTTPS_PORT   443
@@ -38,12 +39,12 @@
 
 #define CAP_MAX_HOST_LEN  512
 
-struct cap_stats {
+typedef struct cap_stats_s {
 	uint64_t pkts, bytes, events, drop, send, procs;
     uint64_t dns, http, https;
 	uint64_t min_space;
 	struct   timeval t;
-};
+} cap_stats_t;
 
 typedef struct cap_http_request_s {
     int    hflag;
@@ -63,9 +64,10 @@ typedef struct cap_worker_s {
     lua_State *L;
 
     struct nm_desc   *inm;
-    struct nm_desc   *onm;
 
-    struct cap_stats  ctr;
+    pcap_t  *opcap;
+
+    cap_stats_t  ctr;
 } cap_worker_t;
 
 typedef struct cap_gtp_encap_hdr_s {
@@ -76,6 +78,7 @@ typedef struct cap_gtp_encap_hdr_s {
 typedef struct cap_pkt_s {
     struct ether_header *ether_hdr;
     struct iphdr        *ip_hdr;
+    struct ipv6hdr      *ipv6_hdr;
     struct tcphdr       *tcp_hdr;
     struct udphdr       *udp_hdr;
 
@@ -94,17 +97,17 @@ static int http_header_value_cb(http_parser *parser, const char *buf, size_t len
 static int http_url_cb(http_parser *parser, const char *buf, size_t len);
 
 static int cap_process_udp(cap_pkt_t *pkt, u_char *cp, size_t len,
-                            struct cap_stats    *stats,
-                            cap_worker_t        *worker);
+                            cap_stats_t    *stats,
+                            cap_worker_t   *worker);
 
 static int cap_process_tcp(cap_pkt_t *pkt, u_char *cp, size_t len,
-                            struct cap_stats    *stats,
-                            cap_worker_t        *worker);
-
-//static void cap_worker_connect_redis(cap_worker_t *worker);
+                            cap_stats_t    *stats,
+                            cap_worker_t   *worker);
 
 #define PKT_SRC_ADDR_FIELD      "src_addr"
 #define PKT_DST_ADDR_FIELD      "dst_addr"
+#define PKT_SRC_V6ADDR_FIELD    "src_v6addr"
+#define PKT_DST_V6ADDR_FIELD    "dst_v6addr"
 #define PKT_SRC_PORT_FIELD      "src_port"
 #define PKT_DST_PORT_FIELD      "dst_port"
 #define PKT_TEID_FIELD          "teid"
@@ -115,134 +118,37 @@ static int cap_process_tcp(cap_pkt_t *pkt, u_char *cp, size_t len,
 
 static int cap_lua_record(lua_State *L);
 static int cap_lua_inject(lua_State *L);
-/*
-typedef struct cap_lua_log_s {
-    char      *src_addr;
-    char      *dst_addr;
-    char      *gtp_dst_addr;
-    char      *domain;
-    char      *uri;
-    uint32_t   teid;
-    int        src_port;
-    int        dst_port;
-} cap_lua_log_t;
-*/
+
 static const struct luaL_reg hjk_lib[] = {
     {"record", cap_lua_record},
     {"inject", cap_lua_inject},
     {NULL, NULL}  /* sentinel */
 };
-/*
-static int cap_lua_log_info_get(lua_State *L, cap_lua_log_t *cap_log)
-{
-    lua_getfield(L, -1, PKT_TEID_FIELD);
-    if (lua_isnumber(L, -1)) {
-        cap_log->teid = lua_tonumber(L, -1);
-    }
-    lua_pop(L, 1);
 
-    lua_getfield(L, -1, PKT_GTP_DST_FIELD);
-    if (lua_isstring(L, -1)) {
-        cap_log->gtp_dst_addr = strdup(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);    
-
-    lua_getfield(L, -1, PKT_SRC_ADDR_FIELD);
-    if (lua_isstring(L, -1)) {
-        cap_log->src_addr = strdup(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);    
-
-    lua_getfield(L, -1, PKT_DST_ADDR_FIELD);
-    if (lua_isstring(L, -1)) {
-        cap_log->dst_addr = strdup(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, -1, PKT_DOMAIN_FIELD);
-    if (lua_isstring(L, -1)) {
-        cap_log->domain = strdup(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, -1, PKT_URI_FIELD);
-    if (lua_isstring(L, -1)) {
-        cap_log->uri = strdup(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, -1, PKT_SRC_PORT_FIELD);
-    if (lua_isnumber(L, -1)) {
-        cap_log->src_port = lua_tonumber(L, -1);
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, -1, PKT_DST_PORT_FIELD);
-    if (lua_isnumber(L, -1)) {
-        cap_log->dst_port = lua_tonumber(L, -1);
-    }
-    lua_pop(L, 1);    
-
-    return 0;
-}
-
-static int cap_lua_log_info_free(cap_lua_log_t *cap_log)
-{
-    if (cap_log->src_addr) {
-        free(cap_log->src_addr);
-    }
-
-    if (cap_log->dst_addr) {
-        free(cap_log->dst_addr);
-    }
-
-    if (cap_log->domain) {
-        free(cap_log->domain);
-    }
-
-    if (cap_log->uri) {
-        free(cap_log->uri);
-    }
-
-    if (cap_log->gtp_dst_addr) {
-        free(cap->log->gtp_dst_addr);
-    }
-
-    return 0;
-}
-*/
 static int cap_lua_record(lua_State *L)
 {
-/*    
-    cap_lua_log_t cap_log;
-
-    bzero(&cap_log, sizeof(cap_lua_log_t));
-
-    if (lua_gettop(L) != 1) {
-        return luaL_error(L, "expecting exactly 1 arguments");
-    }
-
-    if (!lua_istable(L, 1)) {
-        return luaL_error(L, "expecting lua table as arguments");
-    }
-
-    cap_lua_log_info_get(L, &cap_log);
-*/
-    char   src_addr_buf[32] = {0};
-    char   dst_addr_buf[32] = {0};
-    char   gtp_dest_buf[32] = {0};
+    char   src_addr_buf[INET6_ADDRSTRLEN] = {0};
+    char   dst_addr_buf[INET6_ADDRSTRLEN] = {0};
+    char   gtp_dest_buf[INET6_ADDRSTRLEN] = {0};
 
     int    src_port = 0, dst_port = 0;
     struct in_addr   in;
+    
+    uint32_t  teid = 0;
 
     lua_getglobal(L, "pkt");
     cap_pkt_t *pkt = lua_touserdata(L, -1);
 
-    in.s_addr = pkt->ip_hdr->saddr;
-    snprintf(src_addr_buf, sizeof(src_addr_buf), "%s", inet_ntoa(in));
-
-    in.s_addr = pkt->ip_hdr->daddr;
-    snprintf(dst_addr_buf, sizeof(dst_addr_buf), "%s", inet_ntoa(in));
+    if (pkt->ip_hdr) {
+        in.s_addr = pkt->ip_hdr->saddr;
+        snprintf(src_addr_buf, sizeof(src_addr_buf), "%s", inet_ntoa(in));
+    
+        in.s_addr = pkt->ip_hdr->daddr;
+        snprintf(dst_addr_buf, sizeof(dst_addr_buf), "%s", inet_ntoa(in));
+    } else {
+        inet_ntop(AF_INET6, &pkt->ipv6_hdr->saddr, src_addr_buf, INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET6, &pkt->ipv6_hdr->daddr, dst_addr_buf, INET6_ADDRSTRLEN);       
+    }
 
     if (pkt->gtp_encap_hdr.ip_hdr != NULL) {
         in.s_addr = pkt->gtp_encap_hdr.ip_hdr->daddr;
@@ -257,34 +163,24 @@ static int cap_lua_record(lua_State *L)
         dst_port = ntohs(pkt->udp_hdr->dest);;
     }
 
+    if (pkt->gtp_hdr) {
+        teid = pkt->gtp_hdr->teid;
+    }
+
 
     log_info("pkt: [src_addr: %s, dst_addr: %s, src_port: %d, dst_port %d, domain: %s tunnel: %08x-%s]",
-                src_addr_buf, dst_addr_buf, src_port, dst_port, pkt->domain, pkt->gtp_hdr->teid, gtp_dest_buf);
-
-    //cap_lua_log_info_free(&cap_log);
+                src_addr_buf, dst_addr_buf, src_port, dst_port, pkt->domain, teid, gtp_dest_buf);
 
     return 0;
 }
 
 static int cap_lua_inject(lua_State *L)
 {
-/*
-    uint16_t vlanID;
-
-    vlanID = 0;
-
-    if (lua_gettop(L) != 1) {
-        return luaL_error(L, "expecting exactly 1 arguments");
-    }
-
-    if (!lua_istable(L, 1)) {
-        return luaL_error(L, "expecting lua table as arguments");
-    }    
-*/
     static u_char inject_data[5] = {'h', 'e', 'l', 'l', 'o'};
 
     cap_pkt_t    *pkt; 
     cap_worker_t *worker;
+
     struct ether_addr mac, *res;
 
     if (lua_gettop(L) != 1) {
@@ -307,11 +203,10 @@ static int cap_lua_inject(lua_State *L)
     worker = lua_touserdata(L, -1);
 
     if (pkt->tcp_hdr) {
-        inject_tcp_packet(worker->onm, pkt->ip_hdr, pkt->tcp_hdr, mac.ether_addr_octet, 0, inject_data, sizeof(inject_data));
+        inject_tcp_packet(worker->opcap, pkt->ipv6_hdr, pkt->ip_hdr, pkt->tcp_hdr, mac.ether_addr_octet, 0, inject_data, sizeof(inject_data));
     } else if (pkt->udp_hdr) {
-        inject_udp_packet(worker->onm, pkt->ip_hdr, pkt->udp_hdr, mac.ether_addr_octet, 0, inject_data, sizeof(inject_data));
+        inject_udp_packet(worker->opcap, pkt->ipv6_hdr, pkt->ip_hdr, pkt->udp_hdr, mac.ether_addr_octet, 0, inject_data, sizeof(inject_data));
     }
-
 
     return 0;
 }
@@ -372,69 +267,6 @@ static int http_url_cb(http_parser *parser, const char *buf, size_t len)
     return 0;
 }
 
-#if 0
-static int cap_domain_has_processed(const char *host, cap_worker_t *worker)
-{
-    int         ret = 0;
-    redisReply *reply;
-
-    reply = redisCommand(worker->c, "SISMEMBER domain_set %s", host);
-    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
-        ret = 1;
-        goto done;
-    }
-
-    freeReplyObject(reply);
-
-    reply = redisCommand(worker->c, "SISMEMBER green_set %s", host);
-    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
-        ret = 1;
-        goto done;
-    }    
-
-    freeReplyObject(reply);
-
-    reply = redisCommand(worker->c, "SISMEMBER hdd_set %s", host);
-    if (reply == NULL || reply->type != REDIS_REPLY_INTEGER || reply->integer != 0) {
-        ret = 1;
-    }
-
-done:
-    if (reply != NULL) {
-        freeReplyObject(reply);
-    }    
-
-    return ret;
-}
-#endif
-
-#if 0
-static void cap_process_domain(const char *host, cap_worker_t *worker)
-{
-    redisReply *reply;
-
-    if (worker->c == NULL || worker->c->err || host == NULL) {
-        return;
-    }
-
-    if (cap_domain_has_processed(host, worker)) {
-        return;
-    }
-
-    reply = redisCommand(worker->c, "SADD domain_set %s", host);
-
-    if (reply != NULL) {
-        freeReplyObject(reply);
-    }
-
-    if (worker->c == NULL || worker->c->err) {
-        log_error("worker %d redis connection is down", worker->wid);
-    }
-
-    return;
-}
-#endif
-
 static void l_pushtablestring(lua_State* L , char* key , char* value) 
 {
     lua_pushstring(L, key);
@@ -451,7 +283,9 @@ static void l_pushtablenumber(lua_State *L, char *key, int number)
 
 static int cap_process_lua_script(lua_State *L, cap_pkt_t *pkt)
 {
-    struct in_addr  in;
+    struct in_addr   in;
+
+    char   addr[INET6_ADDRSTRLEN]; 
 
     lua_settop(L, 0);
 
@@ -459,16 +293,26 @@ static int cap_process_lua_script(lua_State *L, cap_pkt_t *pkt)
 
     lua_newtable(L);
 
-    in.s_addr = pkt->gtp_encap_hdr.ip_hdr->daddr;
-    l_pushtablestring(L, PKT_GTP_DST_FIELD, inet_ntoa(in));
+    if (pkt->gtp_encap_hdr.ip_hdr) {
+        in.s_addr = pkt->gtp_encap_hdr.ip_hdr->daddr;
+        l_pushtablestring(L, PKT_GTP_DST_FIELD, inet_ntoa(in));
+    }
 
-    l_pushtablenumber(L, PKT_TEID_FIELD, pkt->gtp_hdr->teid);
+    if (pkt->gtp_hdr) {
+        l_pushtablenumber(L, PKT_TEID_FIELD, pkt->gtp_hdr->teid);
+    }
 
-    in.s_addr = pkt->ip_hdr->saddr;
-    l_pushtablestring(L, PKT_SRC_ADDR_FIELD, inet_ntoa(in));
-
-    in.s_addr = pkt->ip_hdr->daddr;
-    l_pushtablestring(L, PKT_DST_ADDR_FIELD, inet_ntoa(in));
+    if (pkt->ip_hdr != NULL) {
+        in.s_addr = pkt->ip_hdr->saddr;
+        l_pushtablestring(L, PKT_SRC_ADDR_FIELD, inet_ntoa(in));
+        in.s_addr = pkt->ip_hdr->daddr;
+        l_pushtablestring(L, PKT_DST_ADDR_FIELD, inet_ntoa(in));
+    } else {
+        inet_ntop(AF_INET6, &pkt->ipv6_hdr->saddr, addr, INET6_ADDRSTRLEN);
+        l_pushtablestring(L, PKT_SRC_V6ADDR_FIELD, addr);
+        inet_ntop(AF_INET6, &pkt->ipv6_hdr->daddr, addr, INET6_ADDRSTRLEN);
+        l_pushtablestring(L, PKT_DST_V6ADDR_FIELD, addr);
+    }
 
     if (pkt->tcp_hdr != NULL) {
         l_pushtablenumber(L, PKT_SRC_PORT_FIELD, ntohs(pkt->tcp_hdr->source));
@@ -494,7 +338,7 @@ static int cap_process_lua_script(lua_State *L, cap_pkt_t *pkt)
 }
 
 static int cap_process_http_inject(cap_pkt_t *pkt, u_char *http_data, size_t n,
-                                        struct cap_stats    *stats,
+                                        cap_stats_t         *stats,
                                         cap_worker_t        *worker)
 {
     int          parserd;
@@ -516,7 +360,6 @@ static int cap_process_http_inject(cap_pkt_t *pkt, u_char *http_data, size_t n,
     }
 
     stats->procs++;
-    //cap_process_domain(req.host, worker);
 
     pkt->domain = req.host;
     pkt->uri = req.url;
@@ -536,7 +379,7 @@ ret:
 }
 
 static int cap_process_https_inject(cap_pkt_t *pkt, u_char *https_data, size_t n,
-                                        struct cap_stats    *stats,
+                                        cap_stats_t         *stats,
                                         cap_worker_t        *worker)
 {
     int   ret;
@@ -549,7 +392,6 @@ static int cap_process_https_inject(cap_pkt_t *pkt, u_char *https_data, size_t n
 
     stats->procs++;
 
-    //cap_process_domain(host, worker);
     pkt->domain = host;
 
     cap_process_lua_script(worker->L, pkt);
@@ -558,15 +400,19 @@ static int cap_process_https_inject(cap_pkt_t *pkt, u_char *https_data, size_t n
 }
 
 static int cap_process_gtp_cap(cap_pkt_t *pkt, u_char *data, size_t len,
-                                    struct cap_stats    *stats,
-                                    cap_worker_t        *worker)
+                            cap_stats_t  *stats, cap_worker_t  *worker)
 {
     int             parsered;
-    //struct iphdr   *ip_hdr;
+    int             hdrlen;
+    int             protocol;
     gtpuHdr_t       gtp_hdr;
 
     parsered = gtpu_header_parse(data, len, &gtp_hdr);
     if (parsered == -1) {
+        return 0;
+    }
+
+    if (!pkt->ip_hdr) {
         return 0;
     }
 
@@ -575,27 +421,36 @@ static int cap_process_gtp_cap(cap_pkt_t *pkt, u_char *data, size_t len,
     len -= parsered;
     data += parsered;
 
-    if (gtp_hdr.msg_type != 0xff || 
-        len <= sizeof(struct iphdr) + sizeof(struct tcphdr)) {
+    if (gtp_hdr.msg_type != 0xff) {
         return 0;
     }
 
     pkt->gtp_encap_hdr.ip_hdr = pkt->ip_hdr;
     pkt->gtp_encap_hdr.udp_hdr = pkt->udp_hdr;
 
-    pkt->ip_hdr = NULL;
+    pkt->ip_hdr  = NULL;
     pkt->udp_hdr = NULL;
     pkt->tcp_hdr = NULL;
 
-    pkt->ip_hdr = (struct iphdr *)data;
-    if (pkt->ip_hdr->version != IPVERSION) {
-        return 0; 
-    }   
+    switch ((*data & 0x60) >> 4) {
+        case IPVERSION:
+            pkt->ip_hdr = (struct iphdr *)data;
+            hdrlen = pkt->ip_hdr->ihl * 4;
+            protocol = pkt->ip_hdr->protocol;
+            break;
+        case IPV6VERSION:
+            pkt->ipv6_hdr = (struct ipv6hdr *)data;
+            hdrlen = sizeof(struct ipv6hdr);
+            protocol = pkt->ipv6_hdr->nexthdr;
+            break;
+        default:
+            break;
+    }
 
-    data += (pkt->ip_hdr->ihl * 4);
-    len -= (pkt->ip_hdr->ihl * 4);
+    data += hdrlen;
+    len -= hdrlen;
 
-    switch (pkt->ip_hdr->protocol) {
+    switch (protocol) {
         case IPPROTO_TCP:
             return cap_process_tcp(pkt, data, len, stats, worker);
         case IPPROTO_UDP:
@@ -608,8 +463,7 @@ static int cap_process_gtp_cap(cap_pkt_t *pkt, u_char *data, size_t len,
 }
 
 static int cap_process_dns_cap(cap_pkt_t *pkt, u_char *data, size_t len,
-                                   struct cap_stats    *stats,
-                                   cap_worker_t        *worker)
+                            cap_stats_t *stats, cap_worker_t *worker)
 {
     dns_message_t        msg;
     struct dns_question *qs;
@@ -637,8 +491,7 @@ static int cap_process_dns_cap(cap_pkt_t *pkt, u_char *data, size_t len,
 }
 
 static int cap_process_tcp(cap_pkt_t *pkt, u_char *cp, size_t len, 
-                            struct cap_stats    *stats,
-                            cap_worker_t        *worker)
+                        cap_stats_t *stats, cap_worker_t *worker)
 {
     uint8_t              tcp_hl;
 
@@ -669,8 +522,7 @@ static int cap_process_tcp(cap_pkt_t *pkt, u_char *cp, size_t len,
 }
 
 static int cap_process_udp(cap_pkt_t *pkt, u_char *cp, size_t len,
-                            struct cap_stats    *stats,
-                            cap_worker_t        *worker)
+                        cap_stats_t *stats, cap_worker_t *worker)
 {
     static int udp_header_size = 8;
 
@@ -735,51 +587,10 @@ static uint64_t cap_wait_for_next_report(struct timeval *prev, struct timeval *c
 	return delta.tv_sec * 1000000 + delta.tv_usec;
 }
 
-#if 0
-static int parse_nmr_config(const char *conf, struct nmreq *nmr) {
-    char *w, *tok;
-    int i, v;
-
-    nmr->nr_tx_rings = nmr->nr_rx_rings = 0;
-    nmr->nr_tx_slots = nmr->nr_rx_slots = 0;
-    if (conf == NULL || !*conf)
-        return 0;
-    w = strdup(conf);
-    for (i = 0, tok = strtok(w, ","); tok; i++, tok = strtok(NULL, ",")) {
-        v = atoi(tok);
-        switch (i) {
-        case 0:
-            nmr->nr_tx_slots = nmr->nr_rx_slots = v;
-            break;
-        case 1:
-            nmr->nr_rx_slots = v;
-            break;
-        case 2:
-            nmr->nr_tx_rings = nmr->nr_rx_rings = v;
-            break;
-        case 3:
-            nmr->nr_rx_rings = v;
-            break;
-        default:
-            log_error("ignored config: %s", tok);
-            break;
-        }
-    }
-    log_info("txr %d txd %d rxr %d rxd %d", nmr->nr_tx_rings, nmr->nr_tx_slots,
-      nmr->nr_rx_rings, nmr->nr_rx_slots);
-    free(w);
-    return (nmr->nr_tx_rings || nmr->nr_tx_slots || nmr->nr_rx_rings ||
-            nmr->nr_rx_slots)
-               ? NM_OPEN_RING_CFG
-               : 0;
-}
-#endif
-
 static int cap_ether_header_parser(cap_pkt_t *pkt, u_char *data, int len)
 {
     int                  parsered;
     uint16_t             eth;
-    //struct ether_header *eth_hdr;
     ether_vlan_hdr_t    *vlan_hdr;
 
     parsered = 0;
@@ -787,7 +598,7 @@ static int cap_ether_header_parser(cap_pkt_t *pkt, u_char *data, int len)
     pkt->ether_hdr = (struct ether_header *)data;
     eth = ntohs(pkt->ether_hdr->ether_type);
 
-    if (eth != ETHERTYPE_IP && eth != ETHERTYPE_8021Q) {
+    if (eth != ETHERTYPE_IP && eth != ETHERTYPE_8021Q && eth != ETHERTYPE_IPV6) {
         return -1;
     }
 
@@ -798,27 +609,45 @@ static int cap_ether_header_parser(cap_pkt_t *pkt, u_char *data, int len)
 
         vlan_hdr = (ether_vlan_hdr_t *)(data + ETHER_HDR_LEN);
 
-        if (ntohs(vlan_hdr->eth) != ETHERTYPE_IP) {
+        eth = ntohs(vlan_hdr->eth);
+
+        if (eth != ETHERTYPE_IP && eth != ETHERTYPE_IPV6) {
             return -1;
         }
     }
+
+    pkt->ether_hdr->ether_type = eth;
 
     return parsered;
 }
 
 static int cap_ip_header_parser(cap_pkt_t *pkt, u_char *data, int len)
 {
-    pkt->ip_hdr = (struct iphdr *)data;
-    if (pkt->ip_hdr->version != IPVERSION) {
+    if (len <= sizeof(struct iphdr)) {
         return -1;
     }
+
+    pkt->ip_hdr = (struct iphdr *)data;  //IPVERSION
 
     return pkt->ip_hdr->ihl * 4;
 }
 
-static int cap_process_packets_helper(u_char *data, int len, struct cap_stats *stats, cap_worker_t *worker)
+static int cap_ipv6_header_parser(cap_pkt_t *pkt, u_char *data, int len)
+{
+    if (len <= sizeof(struct ipv6hdr)) {
+        return -1;
+    }
+
+    pkt->ipv6_hdr = (struct ipv6hdr *)data;
+
+    return sizeof(struct ipv6hdr);
+}
+
+static int cap_process_packets_helper(u_char *data, int len, cap_stats_t *stats, cap_worker_t *worker)
 {
     int                  ret, parsered;
+    int                  protocol;
+
     u_char              *cp;
     cap_pkt_t            pkt;
 
@@ -826,23 +655,41 @@ static int cap_process_packets_helper(u_char *data, int len, struct cap_stats *s
 
     cp = data;
     parsered = 0;
+    ret = 0;
 
     lua_pushlightuserdata(worker->L, &pkt);
     lua_setglobal(worker->L, "pkt");
 
     ret = cap_ether_header_parser(&pkt, cp, len);
-    if (ret < 0 || len - ret <= sizeof(struct iphdr)) {
-        return 0;
+    if (ret < 0) {
+        goto clean;
     }
     parsered += ret;
 
-    ret = cap_ip_header_parser(&pkt, cp + parsered, len - parsered);
-    if (ret < 0 || len - parsered - ret <= 0) {
-        return 0;
+    switch (pkt.ether_hdr->ether_type) {
+        case ETHERTYPE_IP:
+            ret = cap_ip_header_parser(&pkt, cp + parsered, len - parsered);
+            break;
+        case ETHERTYPE_IPV6:
+            ret = cap_ipv6_header_parser(&pkt, cp + parsered, len - parsered);
+            break;
+        default:
+            goto clean;
     }
+
+    if (ret < 0) {
+        goto clean;
+    }
+
     parsered += ret;
 
-    switch (pkt.ip_hdr->protocol) {
+    if (pkt.ip_hdr) {
+        protocol = pkt.ip_hdr->protocol;
+    } else {
+        protocol = pkt.ipv6_hdr->nexthdr;
+    }
+
+    switch (protocol) {
         case IPPROTO_TCP:
             ret = cap_process_tcp(&pkt, cp + parsered, len - parsered, stats, worker);
             break;
@@ -854,13 +701,14 @@ static int cap_process_packets_helper(u_char *data, int len, struct cap_stats *s
             break;
     }
 
+clean:
     lua_pushnil(worker->L);
     lua_setglobal(worker->L, "pkt");
 
     return ret;
 }
 
-static int cap_process_packets(struct netmap_ring *ring, struct cap_stats *stats, cap_worker_t *worker)
+static int cap_process_packets(struct netmap_ring *ring, cap_stats_t *stats, cap_worker_t *worker)
 {
     int      cur, rx, n, s;
 
@@ -873,7 +721,6 @@ static int cap_process_packets(struct netmap_ring *ring, struct cap_stats *stats
 
         stats->bytes += slot->len;
 
-        //dump_payload(p, slot->len, ring, cur);
         s = cap_process_packets_helper((u_char *)p, slot->len, stats, worker);
         if (s > 0) {
             stats->send += s;
@@ -888,42 +735,6 @@ static int cap_process_packets(struct netmap_ring *ring, struct cap_stats *stats
     return (rx);
 }
 
-#if 0
-static void cap_worker_connect_redis(cap_worker_t *worker)
-{
-    time_t  now = time(NULL);
-
-    if (now - worker->redis_conn_time < CAP_REDIS_CONNECT_INTERVAL) {
-        return;
-    }
-
-    worker->redis_conn_time = now;
-
-    if (worker->c) {
-        redisFree(worker->c);
-        worker->c = NULL;
-    }
-
-    redisContext *c = redisConnect(worker->redis_addr, worker->redis_port);
-    if (c == NULL || c->err) {
-        if (c) {
-            log_error("worker %d failed connect redis: %s", worker->wid, c->errstr);
-            redisFree(c);
-        } else {
-            //unexpected
-        }
-
-        return;
-    }
-
-    log_info("worker %d connect redis successful", worker->wid);
-
-    worker->c = c;
-
-    return;
-}
-#endif
-
 static void *cap_worker(void *arg)
 {
     cap_worker_t *worker = (cap_worker_t *)arg;
@@ -934,7 +745,7 @@ static void *cap_worker(void *arg)
     struct netmap_if   *nifp;
     struct netmap_ring *rxring;
 
-    struct cap_stats cur;
+    cap_stats_t cur;
 
     struct pollfd pfd = {.fd = worker->inm->fd, .events = POLLIN};
 
@@ -966,12 +777,6 @@ static void *cap_worker(void *arg)
     nifp = worker->inm->nifp;
 
     while (1) {
-        #if 0
-        if (worker->c == NULL || worker->c->err) {
-            cap_worker_connect_redis(worker);
-        }
-        #endif
-
         ret = poll(&pfd, 1, 1 * 1000);
         
         if (ret == 0) {
@@ -1016,7 +821,8 @@ done:
 static void cap_log_status(cap_worker_t *workers, int nring)
 {
     int    i;
-    struct cap_stats prev, cur;
+
+    cap_stats_t prev, cur;
 
     prev.pkts = prev.bytes = prev.events = prev.send = 0;
     prev.http = prev.https = prev.dns = 0;
@@ -1025,7 +831,7 @@ static void cap_log_status(cap_worker_t *workers, int nring)
     for (;;) {
         char b1[40], b2[40], b3[40], b4[70], b5[40], b6[40], b7[40];
         uint64_t pps, usec;
-        struct cap_stats x;
+        cap_stats_t x;
         double abs;
 
         usec = cap_wait_for_next_report(&prev.t, &cur.t);
@@ -1107,6 +913,23 @@ static lua_State *cap_script_create(const char *script)
     return L;
 }
 
+pcap_t *cap_create_opcap(const char *interface, char *errbuf, size_t errlen) 
+{
+    pcap_t  *pcap;
+
+    pcap = pcap_create(interface, errbuf);
+    if (!pcap) {
+        return NULL;
+    }
+
+    if (pcap_activate(pcap)) {
+        snprintf(errbuf, errlen, "%s", pcap_geterr(pcap));
+        return NULL;
+    }
+
+    return pcap;
+}
+
 void cap_service(hjk_cycle_t *cycle)
 {
     int             i;
@@ -1114,8 +937,8 @@ void cap_service(hjk_cycle_t *cycle)
 
     struct nmreq    base_nmd;
 
-    char            iether_name[64];
-    char            oether_name[64];
+    char    errbuf[PCAP_ERRBUF_SIZE];
+    char    iether_name[64];
 
     cap_worker_t   *workers;
 
@@ -1132,17 +955,16 @@ void cap_service(hjk_cycle_t *cycle)
 
     for (i = 0; i < rings; i++) {
         snprintf(iether_name, sizeof(iether_name), "netmap:%s-%d/R", cycle->iether, i);
-        snprintf(oether_name, sizeof(oether_name), "netmap:%s-%d/T", cycle->oether, i);
 
         workers[i].inm = nm_open(iether_name, &base_nmd, 0, NULL);
-        if (workers[i].inm == NULL) {
-            log_error("failed to open %s: %s", iether_name, strerror(errno));
+        if (!workers[i].inm) {
+            log_error("failed open %s: %s", iether_name, strerror(errno));
             exit(1);
         }
 
-        workers[i].onm = nm_open(oether_name, NULL, 0, NULL);
-        if (workers[i].onm == NULL) {
-            log_error("failed to open %s: %s", oether_name, strerror(errno));
+        workers[i].opcap = cap_create_opcap(cycle->oether, errbuf, sizeof(errbuf));
+        if (!workers[i].opcap) {
+            log_error("failed open %s: %s", cycle->oether, errbuf);
             exit(1);
         }
 
@@ -1152,8 +974,6 @@ void cap_service(hjk_cycle_t *cycle)
         lua_setglobal(workers[i].L, "worker");
 
         workers[i].wid = i;
-        //workers[i].redis_addr = strdup(cycle->raddr);
-        //workers[i].redis_port = cycle->rport;
         workers[i].affinity = (cycle->affinity + i) % sysconf(_SC_NPROCESSORS_ONLN);;
 
         pthread_create(&workers[i].tid, NULL, cap_worker, &workers[i]);

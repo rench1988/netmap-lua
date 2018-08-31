@@ -244,8 +244,6 @@ int main(int argc, const char *argv[])
         log_error("worker process[%d] shutdown[%s]", pid, WIFEXITED(status) ? "exited" : "unexpected");
     }
 
-    //log_error("program unexpected exit");
-
     return 0;
 }
 

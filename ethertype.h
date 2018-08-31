@@ -11,6 +11,10 @@
 #define ETHERTYPE_IP 0x0800 /* IP protocol */
 #endif
 
+#ifndef ETHERTYPE_IPV6 
+#define ETHERTYPE_IPV6 0x86dd
+#endif 
+
 #ifndef ETHERTYPE_ARP
 #define ETHERTYPE_ARP 0x0806 /* Addr. resolution protocol */
 #endif

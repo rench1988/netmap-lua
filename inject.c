@@ -1,6 +1,7 @@
 #include "inject.h"
 #include "log.h"
 #include "ethertype.h"
+#include "pg_inet.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -9,8 +10,6 @@
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#define NETMAP_WITH_LIBS
-#include <net/netmap_user.h>
 #include <net/ethernet.h>
 
 uint8_t srcmac[6] = {0xf8,0x98,0xef,0xa4,0x0f,0x55};
@@ -69,7 +68,7 @@ static void dump_payload(const char *_p, int len) {
 }
 #endif
 
-static u_char *inject_fill_2lay_data(u_char *buf, uint8_t *src, uint8_t *dst, uint16_t vlanID)
+static u_char *inject_fill_2lay_data(u_char *buf, uint8_t *src, uint8_t *dst, uint16_t eth_type, uint16_t vlanID)
 {
     uint16_t  size;
     uint16_t *vp;
@@ -81,7 +80,7 @@ static u_char *inject_fill_2lay_data(u_char *buf, uint8_t *src, uint8_t *dst, ui
     bcopy(src, eh->ether_shost, ETHERTYPE_MAC_LEN);
     bcopy(dst, eh->ether_dhost, ETHERTYPE_MAC_LEN);
 
-    eh->ether_type = vlanID ? htons(ETHERTYPE_8021Q) : htons(ETHERTYPE_IP);
+    eh->ether_type = vlanID ? htons(ETHERTYPE_8021Q) : htons(eth_type);
 
     if (vlanID) {
         vp = (uint16_t *)(buf + sizeof(*eh));
@@ -90,7 +89,7 @@ static u_char *inject_fill_2lay_data(u_char *buf, uint8_t *src, uint8_t *dst, ui
         *vp = htons(vlanID);
 
         vp += 1;
-        *vp = htons(ETHERTYPE_IP);
+        *vp = htons(eth_type);
 
         size += 4;
     }
@@ -98,8 +97,7 @@ static u_char *inject_fill_2lay_data(u_char *buf, uint8_t *src, uint8_t *dst, ui
     return buf + size;
 }
 
-static u_char *inject_fill_3lay_data(u_char *buf, struct iphdr *ip_hdr, int pkt_len, int protocol)
-{
+static int inject_fill_ipv4_header(u_char *buf, struct iphdr *ip_hdr, int pkt_len, int protocol) {
     struct iphdr  *ip = (struct iphdr *)buf;
 
     ip->check = 0;
@@ -108,51 +106,106 @@ static u_char *inject_fill_3lay_data(u_char *buf, struct iphdr *ip_hdr, int pkt_
     ip->ihl = sizeof(*ip) >> 2;
     ip->id = 0;
     ip->tos = IPTOS_LOWDELAY;
-    ip->tot_len = ntohs(pkt_len - sizeof(struct ether_header));
+    ip->tot_len = htons(pkt_len - sizeof(struct ether_header));
     ip->frag_off = htons(0x4000); /* Don't fragment */
     ip->ttl = IPDEFTTL;
-    ip->protocol   = protocol;
+    ip->protocol = protocol;
     ip->daddr = ip_hdr->saddr;
     ip->saddr = ip_hdr->daddr;
     ip->check = wrapsum(checksum(ip, sizeof(*ip), 0));
 
-    return buf + sizeof(struct iphdr);
+    return sizeof(struct iphdr);    
 }
 
-static u_char *inject_fill_udp_data(u_char *buf, struct udphdr *udp_hdr, 
+static int inject_fill_ipv6_header(u_char *buf, struct ipv6hdr *ipv6_hdr, int pkt_len, int protocol) 
+{
+    struct ipv6hdr *ipv6 = (struct ipv6hdr *)buf;
+
+    ipv6->priority = 0;
+    ipv6->version = IPV6VERSION;
+
+    memset(ipv6->flow_lbl, 0x00, sizeof(ipv6->flow_lbl));
+
+    ipv6->payload_len = htons(pkt_len - sizeof(struct ether_header) - sizeof(struct ipv6hdr));
+    ipv6->nexthdr = protocol;
+    ipv6->hop_limit = 48;
+
+    memcpy(&ipv6->saddr, &ipv6_hdr->daddr, sizeof(struct in6_addr));
+    memcpy(&ipv6->daddr, &ipv6_hdr->saddr, sizeof(struct in6_addr));
+
+    return sizeof(struct ipv6hdr);
+}
+
+static u_char *inject_fill_3lay_data(u_char *buf, struct ipv6hdr *ipv6_hdr, 
+                                    struct iphdr *ip_hdr, int pkt_len, int protocol)
+{
+    if (ipv6_hdr) {
+        return buf + inject_fill_ipv6_header(buf, ipv6_hdr, pkt_len, protocol);
+    }
+
+    return buf + inject_fill_ipv4_header(buf, ip_hdr, pkt_len, protocol);
+}
+
+static u_char *inject_fill_udp_data(u_char *buf, struct udphdr *udp_hdr, uint16_t eth,
                     u_char *app_data, int app_len)
 {
-    struct udphdr *udp = (struct udphdr *)buf;
-    struct iphdr  *ip;
+    struct udphdr   *udp = (struct udphdr *)buf;
+    struct iphdr    *ip;
+    struct ipv6hdr  *ipv6;
 
     udp->check = 0;
 
-    ip = (struct iphdr *)(buf - sizeof(*ip));
+    ip = NULL;
+    ipv6 = NULL;
+
+    if (eth == ETHERTYPE_IP) {
+        ip = (struct iphdr *)(buf - sizeof(*ip));
+    } else {
+        ipv6 = (struct ipv6hdr *)(buf - sizeof(*ipv6));
+    }
 
     udp->source = udp_hdr->dest;
     udp->dest = udp_hdr->source;
     udp->len = htons(app_len + sizeof(struct udphdr));    
 
-    udp->check = wrapsum(checksum(
-        udp, sizeof(*udp),       /* udp header */
-        checksum(app_data, /* udp payload */
+    if (eth == ETHERTYPE_IP) {
+        udp->check = wrapsum(checksum(
+            udp, sizeof(*udp),       /* udp header */
+            checksum(app_data, /* udp payload */
                  app_len,
                  checksum(&ip->saddr, /* pseudo header */
                         2 * sizeof(ip->saddr),
                         IPPROTO_UDP + (u_int32_t)ntohs(udp->len)))));
+    } else {
+        udp->check = wrapsum(checksum(
+            udp, sizeof(*udp),       /* udp header */
+            checksum(app_data, /* udp payload */
+                 app_len,
+                 checksum(&ipv6->saddr, /* pseudo header */
+                        2 * sizeof(ipv6->saddr),
+                        IPPROTO_UDP + (u_int32_t)ntohs(udp->len)))));        
+    }
 
     return buf + sizeof(struct udphdr);
 }
 
-static u_char *inject_fill_tcp_data(u_char *buf, struct tcphdr *tcp_hdr, 
+static u_char *inject_fill_tcp_data(u_char *buf, struct tcphdr *tcp_hdr, uint16_t eth,
                     u_char *app_data, int app_len, uint32_t ack)
 {
-    struct tcphdr *tcp = (struct tcphdr *)buf;
-    struct iphdr  *ip;
+    struct tcphdr  *tcp = (struct tcphdr *)buf;
+    struct iphdr   *ip;
+    struct ipv6hdr *ipv6;
 
     tcp->check = 0;
 
-    ip = (struct iphdr *)(buf - sizeof(*ip));
+    ip = NULL;
+    ipv6 = NULL;
+
+    if (eth == ETHERTYPE_IP) {
+        ip = (struct iphdr *)(buf - sizeof(*ip));
+    } else {
+        ipv6 = (struct ipv6hdr *)(buf - sizeof(*ipv6));
+    }
 
     tcp->source = tcp_hdr->dest;
     tcp->dest = tcp_hdr->source;
@@ -164,29 +217,49 @@ static u_char *inject_fill_tcp_data(u_char *buf, struct tcphdr *tcp_hdr,
     tcp->window = htons(8192);
     tcp->urg = 0;
 
-    tcp->check = wrapsum(checksum(
-        tcp, sizeof(*tcp),       /* tcp header */
-        checksum(app_data, /* tcp payload */
-                 app_len,
-                 checksum(&ip->saddr, /* pseudo header */
+    if (eth == ETHERTYPE_IP) {
+        tcp->check = wrapsum(checksum(
+            tcp, sizeof(*tcp),       /* tcp header */
+            checksum(app_data, /* tcp payload */
+                     app_len,
+                     checksum(&ip->saddr, /* pseudo header */
                         2 * sizeof(ip->saddr),
+                        IPPROTO_TCP + app_len + sizeof(struct tcphdr)))));        
+    } else {
+        tcp->check = wrapsum(checksum(
+            tcp, sizeof(*tcp),       /* tcp header */
+            checksum(app_data, /* tcp payload */
+                     app_len,
+                     checksum(&ipv6->saddr, /* pseudo header */
+                        2 * sizeof(ipv6->saddr),
                         IPPROTO_TCP + app_len + sizeof(struct tcphdr)))));
+    }
 
     return buf + sizeof(struct tcphdr);
 }
 
 static int inject_prepare_tcp_pkt(u_char *buf, uint8_t *dstmac, uint16_t vlanID, 
-                        struct iphdr *ip_hdr, struct tcphdr *tcp_hdr, u_char *data, int len)
+                        struct ipv6hdr *ipv6_hdr, struct iphdr *ip_hdr, 
+                        struct tcphdr *tcp_hdr, u_char *data, int len)
 {
+    int        pktlen;
+    uint16_t   eth;
+    uint32_t   ack;
     u_char    *dp = buf;
 
-    int pkt_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr) + len;
-    
-    uint32_t ack = ntohl(tcp_hdr->seq) + ntohs(ip_hdr->tot_len) - (ip_hdr->ihl << 2) - (tcp_hdr->doff << 2);
+    if (ipv6_hdr) {
+        pktlen = sizeof(struct ether_header) + sizeof(struct ipv6hdr) + sizeof(struct tcphdr) + len;
+        ack = ntohl(tcp_hdr->seq) + ntohs(ipv6_hdr->payload_len) - sizeof(struct ipv6hdr) - (tcp_hdr->doff << 2);
+        eth = ETHERTYPE_IPV6;
+    } else {
+        pktlen = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr) + len;
+        ack = ntohl(tcp_hdr->seq) + ntohs(ip_hdr->tot_len) - (ip_hdr->ihl << 2) - (tcp_hdr->doff << 2);
+        eth = ETHERTYPE_IP;
+    }
 
-    dp = inject_fill_2lay_data(dp, (uint8_t *)srcmac, dstmac, vlanID);
-    dp = inject_fill_3lay_data(dp, ip_hdr, pkt_len, IPPROTO_TCP);
-    dp = inject_fill_tcp_data(dp, tcp_hdr, data, len, ack);
+    dp = inject_fill_2lay_data(dp, (uint8_t *)srcmac, dstmac, eth, vlanID);
+    dp = inject_fill_3lay_data(dp, ipv6_hdr, ip_hdr, pktlen, IPPROTO_TCP);
+    dp = inject_fill_tcp_data(dp, tcp_hdr, eth, data, len, ack);
 
     memcpy(dp, data, len);
 
@@ -194,30 +267,38 @@ static int inject_prepare_tcp_pkt(u_char *buf, uint8_t *dstmac, uint16_t vlanID,
 }
 
 static int inject_prepare_udp_pkt(u_char *buf, uint8_t *dstmac, uint16_t vlanID, 
-        struct iphdr *ip_hdr, struct udphdr *udp_hdr, u_char *data, int len)
+                        struct ipv6hdr *ipv6_hdr, struct iphdr *ip_hdr, 
+                        struct udphdr *udp_hdr, u_char *data, int len)
 {
+    int       pktlen;
+    uint16_t  eth;
     u_char   *dp = buf;
 
-    int  pkt_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr) + len;   
+    if (ipv6_hdr) {
+        pktlen = sizeof(struct ether_header) + sizeof(struct ipv6hdr) + sizeof(struct udphdr) + len;
+        eth = ETHERTYPE_IPV6;
+    } else {
+        pktlen = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr) + len;
+        eth = ETHERTYPE_IP;
+    }
 
-    dp = inject_fill_2lay_data(dp, (uint8_t *)srcmac, dstmac, vlanID);
-    dp = inject_fill_3lay_data(dp, ip_hdr, pkt_len, IPPROTO_UDP);
-    dp = inject_fill_udp_data(dp, udp_hdr, data, len);
+    dp = inject_fill_2lay_data(dp, (uint8_t *)srcmac, dstmac, eth, vlanID);
+    dp = inject_fill_3lay_data(dp, ipv6_hdr, ip_hdr, pktlen, IPPROTO_UDP);
+    dp = inject_fill_udp_data(dp, udp_hdr, eth, data, len);
 
     memcpy(dp, data, len);
 
     return dp - buf + len;
 }
 
-static int inject_packet_send(struct nm_desc *nmd, u_char *pkt, int pktlen)
+/*
+static int inject_packet_send(pcap_t *opcap, u_char *pkt, int pktlen)
 {
     int   i;
     int   cur;
 
     struct netmap_if *nifp;
     struct netmap_ring *txring = NULL;
-
-    //dump_payload((const char *)pkt, pktlen);
 
     if (ioctl(nmd->fd, NIOCTXSYNC, NULL) < 0) {
         log_error("ioctl error on nic: %s", strerror(errno));
@@ -258,31 +339,34 @@ static int inject_packet_send(struct nm_desc *nmd, u_char *pkt, int pktlen)
 
     return i <= nmd->last_tx_ring ? 1 : 0;
 }
+*/
 
-int inject_tcp_packet(struct nm_desc *nmd, struct iphdr *ip_hdr, struct tcphdr *tcp_hdr, 
-                    uint8_t *mac, uint16_t vlanID, u_char *data, int len)
-{
-    int    pktlen;
-    u_char pkt[MAX_PKT_SIZE];
-
-    pktlen = inject_prepare_tcp_pkt(pkt, mac, vlanID, ip_hdr, tcp_hdr, data, len);
-
-    return inject_packet_send(nmd, pkt, pktlen);
+static int inject_packet_send(pcap_t *opcap, u_char *pkt, int pktlen) {
+    return pcap_inject(opcap, pkt, pktlen);
 }
 
-int inject_udp_packet(struct nm_desc *nmd, struct iphdr *ip_hdr, struct udphdr *udp_hdr, 
-                    uint8_t *mac, uint16_t vlanID, u_char *data, int len)
+int inject_tcp_packet(pcap_t *opcap, struct ipv6hdr *ipv6_hdr, struct iphdr *ip_hdr, 
+                    struct tcphdr *tcp_hdr, uint8_t *mac, uint16_t vlanID, u_char *data, 
+                    int len)
 {
     int    pktlen;
     u_char pkt[MAX_PKT_SIZE];
 
-    pktlen = inject_prepare_udp_pkt(pkt, mac, vlanID, ip_hdr, udp_hdr, data, len);
+    pktlen = inject_prepare_tcp_pkt(pkt, mac, vlanID, ipv6_hdr, ip_hdr, tcp_hdr, data, len);
+
+    return inject_packet_send(opcap, pkt, pktlen);
+}
+
+int inject_udp_packet(pcap_t *opcap, struct ipv6hdr *ipv6_hdr, struct iphdr *ip_hdr, 
+                    struct udphdr *udp_hdr, uint8_t *mac, uint16_t vlanID, u_char *data, 
+                    int len)
+{
+    int    pktlen;
+    u_char pkt[MAX_PKT_SIZE];
+
+    pktlen = inject_prepare_udp_pkt(pkt, mac, vlanID, ipv6_hdr, ip_hdr, udp_hdr, data, len);
 
     //dump_payload(pkt, pktlen);
 
-    return inject_packet_send(nmd, pkt, pktlen);
+    return inject_packet_send(opcap, pkt, pktlen);
 }
-
-
-
-
