@@ -1,2 +1,1 @@
-netmap as a packet capture frame  
-lua as a packet processer(record packet or inject packet)
+暴露lua接口用于处理netmap抓取到的包(目前支持包注入接口和包的日志接口).
